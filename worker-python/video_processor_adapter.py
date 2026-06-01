@@ -1064,6 +1064,14 @@ def draw_waveform_frame(
     if global_max < 1000.0:
         global_max = 1000.0
         
+    # Calculate a robust scale factor using the 90th percentile (scale_max)
+    # to make normal speech volume activate the visualizer and bounce animations.
+    sorted_amps = sorted(amplitudes) if amplitudes else []
+    p90_idx = int(len(sorted_amps) * 0.90)
+    scale_max = sorted_amps[p90_idx] if sorted_amps else 32768.0
+    if scale_max < 1000.0:
+        scale_max = 1000.0
+        
     # Helper 1: Draw dynamic, reactive bouncing overlay image in RAM
     def draw_overlay_to_canvas():
         if not img_cfg.enabled:
@@ -1095,7 +1103,7 @@ def draw_waveform_frame(
                         bounce_scale = bounce_scales[frame_idx]
                     elif amplitudes and frame_idx < len(amplitudes):
                         current_amp = amplitudes[frame_idx]
-                        bounce_scale = 1.0 + 0.15 * (current_amp / global_max)
+                        bounce_scale = 1.0 + 0.15 * min(1.0, current_amp / scale_max)
                         
                 new_w = max(1, int(w * bounce_scale))
                 new_h = max(1, int(h * bounce_scale))
@@ -1139,7 +1147,7 @@ def draw_waveform_frame(
                 bounce_scale = bounce_scales[frame_idx]
             elif amplitudes and frame_idx < len(amplitudes):
                 current_amp = amplitudes[frame_idx]
-                bounce_scale = 1.0 + 0.15 * (current_amp / global_max)
+                bounce_scale = 1.0 + 0.15 * min(1.0, current_amp / scale_max)
             
         new_w = max(1, int(w * bounce_scale))
         new_h = max(1, int(h * bounce_scale))
@@ -1285,7 +1293,7 @@ def draw_waveform_frame(
                     bar_color = c_line
                     mirror_color = c_fill
 
-                h_bar = int((amp / global_max) * sensitivity * max_height * 0.72)
+                h_bar = int(min(1.2, amp / scale_max) * sensitivity * max_height * 0.95)
                 h_bar = max(4, min(max_height, h_bar))
                 
                 lx = start_x_local + i * step
@@ -1334,7 +1342,7 @@ def draw_waveform_frame(
                     bar_color = c_line
                     mirror_color = c_fill
 
-                h_bar = int((amp / global_max) * sensitivity * max_height * 0.72)
+                h_bar = int(min(1.2, amp / scale_max) * sensitivity * max_height * 0.95)
                 h_bar = max(4, min(max_height, h_bar))
                 
                 lx = 0.0
@@ -1380,7 +1388,7 @@ def draw_waveform_frame(
                     mirror_color = c_fill
 
                 angle = (i / bars_count) * 2 * math.pi + (w_cfg.rotation * math.pi / 180.0)
-                h_bar = int((amp / global_max) * sensitivity * max_height * 0.72)
+                h_bar = int(min(1.2, amp / scale_max) * sensitivity * max_height * 0.95)
                 h_bar = max(4, min(max_height, h_bar))
                 
                 if path_shape == "circle":
@@ -1433,7 +1441,7 @@ def draw_waveform_frame(
                     bar_color = c_line
                     mirror_color = c_fill
 
-                h_bar = int((amp / global_max) * sensitivity * max_height * 0.72)
+                h_bar = int(min(1.2, amp / scale_max) * sensitivity * max_height * 0.95)
                 h_bar = max(4, min(max_height, h_bar))
                 
                 lx = start_x_local + i * step
@@ -1645,16 +1653,18 @@ def _render_video_impl(config: RenderConfig, progress_callback: Callable[[int, s
     amplitudes = smoothed_envelope_amps
 
     # 2. Tính toán trước dải Bounce Scale lò xo (Spring-Damped Elastic Bounce Envelope) siêu mượt cho ảnh phủ
-    global_max = max(amplitudes) if amplitudes else 20000.0
-    if global_max < 1000.0:
-        global_max = 1000.0
+    sorted_amps_pre = sorted(amplitudes) if amplitudes else []
+    p90_idx_pre = int(len(sorted_amps_pre) * 0.90)
+    scale_max_pre = sorted_amps_pre[p90_idx_pre] if sorted_amps_pre else 20000.0
+    if scale_max_pre < 1000.0:
+        scale_max_pre = 1000.0
         
     bounce_scales = []
     current_scale = 1.0
     bounce_attack = 0.65
     bounce_decay = 0.10
     for amp in amplitudes:
-        normalized_amp = amp / global_max
+        normalized_amp = min(1.1, amp / scale_max_pre)
         target_scale = 1.0 + 0.15 * normalized_amp
         if target_scale > current_scale:
             current_scale += (target_scale - current_scale) * bounce_attack

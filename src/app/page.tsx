@@ -1921,11 +1921,11 @@ export default function Page() {
 
       // Pre-compute simulated amplitudes (được nhân với hệ số nhạy để co giãn động theo thanh trượt)
       const amplitudes: number[] = [];
-      const sens = config.waveform.sensitivity ?? 1.5;
+      const sens = config.waveform.sensitivity ?? 2.5;
       for (let i = 0; i < bars; i++) {
         const bellCurve = Math.sin((Math.PI * i) / bars);
         const jitter = 0.85 + 0.15 * Math.sin(time * 0.8 + i * 0.6);
-        const rawAmp = 0.2 + 0.6 * Math.sin(time + i * 0.06) * (0.8 + 0.2 * Math.sin(time * 2.5 + i * 0.15));
+        const rawAmp = 0.4 + 0.6 * Math.sin(time + i * 0.08) * (0.7 + 0.3 * Math.sin(time * 2.5 + i * 0.15));
         amplitudes.push(Math.max(2, rawAmp * bellCurve * jitter * maxH * (sens / 1.5)));
       }
 
@@ -5910,14 +5910,14 @@ export default function Page() {
                     <div className="slider-container">
                       <div className="slider-header">
                         <span style={{ color: '#ffffff' }}>Độ nhạy nhận sóng âm (Sensitivity)</span>
-                        <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>{config.waveform.sensitivity ?? 1.5}x</span>
+                        <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>{config.waveform.sensitivity ?? 2.5}x</span>
                       </div>
                       <input
                         type="range"
                         min={0.5}
-                        max={5.0}
+                        max={15.0}
                         step={0.1}
-                        value={config.waveform.sensitivity ?? 1.5}
+                        value={config.waveform.sensitivity ?? 2.5}
                         onChange={(e) => setConfig({
                           ...config,
                           waveform: { ...config.waveform, sensitivity: Number(e.target.value) }

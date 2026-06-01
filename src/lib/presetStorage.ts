@@ -93,7 +93,7 @@ export const DEFAULT_PRESET: RenderConfig = {
     height: 300,
     barsCount: 64,
     barWidth: 4,
-    sensitivity: 1.5,
+    sensitivity: 2.5,
     maxHeight: 120,
     rotation: 0,
     mirror: true,
