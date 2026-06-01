@@ -14,7 +14,11 @@ export const DEFAULT_PRESET: RenderConfig = {
     transitionType: 'fade',
     transitionDuration: 1.0,
     randomVideoOrder: true,
-    fillTimeline: true
+    fillTimeline: true,
+    layout: 'columns',
+    seamOverlay: 'shadow',
+    seamGlowColor: '#8b5cf6',
+    featherWidth: 80
   },
   imageOverlay: {
     enabled: true,
@@ -28,12 +32,55 @@ export const DEFAULT_PRESET: RenderConfig = {
     maskShape: 'circle',
     inset: 10,
     feather: 0,
+    roundCorners: 0,
     imageDuration: 5.0,
     imageTransitionDuration: 1.0,
+    autoFitDuration: false,
     randomImageOrder: false,
     bounceEnabled: false,
     items: [],
-    overlayMode: 'cycle'
+    overlayMode: 'cycle',
+    borderEnabled: false,
+    borderWidth: 8,
+    borderColor: '#ffffff',
+    chromaKeyEnabled: false
+  },
+  videoOverlay: {
+    enabled: true,
+    items: [
+      {
+        id: 'video_overlay_subscribe',
+        videoPath: 'D:\\RnD\\Resource\\WaveForm-Edit-Studio\\YouTube Subscribe and Like button green screen -- Subscribe Button -- Green Screen Subscribe Button.mp4',
+        enabled: false,
+        x: 960,
+        y: 800,
+        width: 600,
+        height: 180,
+        opacity: 1.0,
+        chromaKeyEnabled: true,
+        chromaKeyColor: '#00ff00',
+        chromaKeySimilarity: 0.18,
+        chromaKeyBlend: 0.04,
+        loop: true,
+        repeatInterval: 0
+      },
+      {
+        id: 'video_overlay_noise',
+        videoPath: 'D:\\RnD\\Resource\\WaveForm-Edit-Studio\\YTSave_YouTube_Overlay-Super-Black-Background-With-Scra_Media_WjZBOfNbRT0_001_1080p.mp4',
+        enabled: false,
+        x: 960,
+        y: 540,
+        width: 1920,
+        height: 1080,
+        opacity: 0.15,
+        chromaKeyEnabled: true,
+        chromaKeyColor: '#000000',
+        chromaKeySimilarity: 0.12,
+        chromaKeyBlend: 0.05,
+        loop: true,
+        repeatInterval: 0
+      }
+    ]
   },
   waveform: {
     enabled: true,

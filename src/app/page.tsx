@@ -10,7 +10,7 @@ import RenderProgress from '@/components/render/RenderProgress';
 import LogConsole from '@/components/logs/LogConsole';
 import { 
   Video, Image as ImageIcon, Music, Sliders, Type, Camera, 
-  Settings, FolderOpen, Save, RefreshCw, Terminal, Network, Eye, Search, X, Check, Folder, FileAudio, FileVideo, FileImage, FileCode, ArrowLeft, XCircle, HelpCircle
+  Settings, FolderOpen, Save, RefreshCw, Terminal, Network, Eye, Search, X, Check, Folder, FileAudio, FileVideo, FileImage, FileCode, ArrowLeft, XCircle, HelpCircle, Download, Upload
 } from 'lucide-react';
 
 type ConfigTab = 'media' | 'background' | 'overlay' | 'waveform' | 'subtitles' | 'camera' | 'removebg' | 'render';
@@ -21,6 +21,47 @@ interface RealFileItem {
   name: string;
   type: 'dir' | 'file';
   ext?: string;
+}
+
+// Helper function to perform green screen chroma keying with spill reduction on the frontend canvas
+function chromaKeyImage(img: HTMLImageElement): HTMLCanvasElement {
+  const canvas = document.createElement('canvas');
+  canvas.width = img.naturalWidth;
+  canvas.height = img.naturalHeight;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return canvas;
+  ctx.drawImage(img, 0, 0);
+  const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imgData.data;
+  
+  const threshold = 15;
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i];
+    const g = data[i+1];
+    const b = data[i+2];
+    const a = data[i+3];
+    
+    // greenDiff = g - max(r, b)
+    const greenDiff = g - Math.max(r, b);
+    if (greenDiff > threshold) {
+      const lowThresh = threshold;
+      const highThresh = threshold + 25;
+      if (greenDiff >= highThresh) {
+        data[i+3] = 0;
+      } else {
+        const factor = (greenDiff - lowThresh) / (highThresh - lowThresh);
+        data[i+3] = Math.min(a, Math.round(255 * (1 - factor)));
+      }
+      
+      // Spill reduction (removing green edge tints)
+      const rbAvg = Math.floor((r + b) / 2);
+      if (g > rbAvg) {
+        data[i+1] = rbAvg;
+      }
+    }
+  }
+  ctx.putImageData(imgData, 0, 0);
+  return canvas;
 }
 
 export default function Page() {
@@ -55,6 +96,7 @@ export default function Page() {
   });
   
   const [newPresetName, setNewPresetName] = useState<string>('');
+  const [voiceDuration, setVoiceDuration] = useState<number>(0);
 
   // Theme State (Dark / Light Mode)
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
@@ -106,11 +148,12 @@ export default function Page() {
 
   // ACTUAL Filesystem Explorer modal state
   const [isBrowserOpen, setIsBrowserOpen] = useState(false);
-  const [browserField, setBrowserField] = useState<keyof RenderConfig['media'] | 'outputFilename' | 'subtitleFile' | 'rembgInputImage' | null>(null);
+  const [browserField, setBrowserField] = useState<keyof RenderConfig['media'] | 'outputFilename' | 'subtitleFile' | 'rembgInputImage' | 'videoOverlayPath' | 'addVideoOverlayPath' | null>(null);
   const [currentDirPath, setCurrentDirPath] = useState<string>(''); 
   const [dirItems, setDirItems] = useState<RealFileItem[]>([]);
   const [browserMode, setBrowserMode] = useState<'file' | 'dir'>('file');
   const [isLoadingDir, setIsLoadingDir] = useState(false);
+  const [activeBgVideoIdxForBrowse, setActiveBgVideoIdxForBrowse] = useState<number | null>(null);
 
   // Expanded dynamic states for dual-panel Windows explorer
   const [browserDrives, setBrowserDrives] = useState<{ name: string; path: string }[]>([]);
@@ -123,6 +166,7 @@ export default function Page() {
   // Active overlay index for multiple overlay images preview
   const [activeOverlayIdx, setActiveOverlayIdx] = useState<number>(0);
   const [selectedOverlayItemId, setSelectedOverlayItemId] = useState<string | null>(null);
+  const [selectedVideoOverlayItemId, setSelectedVideoOverlayItemId] = useState<string | null>(null);
   const [isRemovingBgMap, setIsRemovingBgMap] = useState<Record<string, boolean>>({});
 
   // Background removal tab states
@@ -145,11 +189,13 @@ export default function Page() {
   const transcribeAbortControllerRef = useRef<AbortController | null>(null);
 
   // Asset preview caching refs
-  const bgVideoRef = useRef<HTMLVideoElement | null>(null);
-  const overlayImageRef = useRef<HTMLImageElement | null>(null);
-  const lastBgVideoPath = useRef<string>('');
+  const bgVideosCacheRef = useRef<Map<string, HTMLVideoElement>>(new Map());
+  const overlayImageRef = useRef<HTMLImageElement | HTMLCanvasElement | null>(null);
+  const videoOverlayCacheRef = useRef<Map<string, HTMLVideoElement>>(new Map());
+  const videoOverlayOffscreenRef = useRef<HTMLCanvasElement | null>(null);
   const lastOverlayImagePath = useRef<string>('');
-  const overlayImagesCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
+  const overlayImagesCacheRef = useRef<Map<string, HTMLImageElement | HTMLCanvasElement>>(new Map());
+  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Load and cache all simultaneous overlay images
   useEffect(() => {
@@ -170,15 +216,29 @@ export default function Page() {
       if (!item.enabled || !item.imagePath) return;
       
       const cached = currentCache.get(item.id);
-      if (cached && cached.getAttribute('data-path') === item.imagePath) {
+      const isKey = item.chromaKeyEnabled ? 'true' : 'false';
+      if (cached && cached.getAttribute('data-path') === item.imagePath && cached.getAttribute('data-key') === isKey) {
         return; // Already loaded correctly
       }
       
       const img = new Image();
       img.src = `/api/fs/file?path=${encodeURIComponent(item.imagePath)}`;
       img.setAttribute('data-path', item.imagePath);
+      img.setAttribute('data-key', isKey);
       img.onload = () => {
-        currentCache.set(item.id, img);
+        if (item.chromaKeyEnabled) {
+          try {
+            const canvas = chromaKeyImage(img);
+            canvas.setAttribute('data-path', item.imagePath);
+            canvas.setAttribute('data-key', isKey);
+            currentCache.set(item.id, canvas);
+          } catch (e) {
+            console.error('Chroma key failed on load:', e);
+            currentCache.set(item.id, img);
+          }
+        } else {
+          currentCache.set(item.id, img);
+        }
       };
       img.onerror = () => {
         currentCache.delete(item.id);
@@ -188,34 +248,60 @@ export default function Page() {
 
   // Automatically load local file streams when assets are selected
   useEffect(() => {
-    const bgPath = config.media.backgroundVideos[0];
-    if (bgPath) {
-      if (bgPath !== lastBgVideoPath.current) {
-        lastBgVideoPath.current = bgPath;
-        const video = document.createElement('video');
-        video.src = `/api/fs/file?path=${encodeURIComponent(bgPath)}`;
-        video.muted = true;
-        video.loop = true;
-        video.playsInline = true;
-        video.autoplay = true;
-        video.onloadeddata = () => {
-          video.play().catch((err) => console.log('Video preview play error:', err));
-        };
-        bgVideoRef.current = video;
+    const currentCache = bgVideosCacheRef.current;
+    const activePaths = (config.media.backgroundVideos || []).filter(Boolean).slice(0, 4);
+    
+    // Clean up cache of videos no longer in active background list
+    const activePathsSet = new Set(activePaths);
+    for (const key of Array.from(currentCache.keys())) {
+      if (!activePathsSet.has(key)) {
+        const video = currentCache.get(key);
+        if (video) {
+          try {
+            video.pause();
+            video.src = '';
+            video.load();
+          } catch (e) {}
+        }
+        currentCache.delete(key);
       }
-    } else {
-      bgVideoRef.current = null;
-      lastBgVideoPath.current = '';
     }
+    
+    // Load new videos
+    activePaths.forEach(path => {
+      if (currentCache.has(path)) return; // Already cached
+      
+      const video = document.createElement('video');
+      video.src = `/api/fs/file?path=${encodeURIComponent(path)}`;
+      video.muted = true;
+      video.loop = true;
+      video.playsInline = true;
+      video.autoplay = true;
+      video.onloadeddata = () => {
+        video.play().catch((err) => console.log('Video preview play error:', err));
+      };
+      currentCache.set(path, video);
+    });
 
     const imgPath = config.media.overlayImages[activeOverlayIdx] || config.media.overlayImages[0];
+    const isKey = config.imageOverlay.chromaKeyEnabled || false;
+    const currentKey = imgPath ? `${imgPath}_${isKey ? 'key' : 'raw'}` : '';
     if (imgPath) {
-      if (imgPath !== lastOverlayImagePath.current) {
-        lastOverlayImagePath.current = imgPath;
+      if (currentKey !== lastOverlayImagePath.current) {
+        lastOverlayImagePath.current = currentKey;
         const img = new Image();
         img.src = `/api/fs/file?path=${encodeURIComponent(imgPath)}`;
         img.onload = () => {
-          overlayImageRef.current = img;
+          if (isKey) {
+            try {
+              overlayImageRef.current = chromaKeyImage(img);
+            } catch (e) {
+              console.error('Fallback chroma key failed:', e);
+              overlayImageRef.current = img;
+            }
+          } else {
+            overlayImageRef.current = img;
+          }
         };
         img.onerror = () => {
           overlayImageRef.current = null;
@@ -225,7 +311,108 @@ export default function Page() {
       overlayImageRef.current = null;
       lastOverlayImagePath.current = '';
     }
-  }, [config.media.backgroundVideos, config.media.overlayImages, activeOverlayIdx]);
+  }, [config.media.backgroundVideos, config.media.overlayImages, activeOverlayIdx, config.imageOverlay.chromaKeyEnabled]);
+
+  // Load and cache video overlays
+  const activeVideoOverlayDeps = config.videoOverlay?.enabled
+    ? JSON.stringify(
+        (config.videoOverlay?.items || [])
+          .filter(item => item.enabled)
+          .map(item => ({ path: item.videoPath, loop: item.loop }))
+      )
+    : '';
+
+  useEffect(() => {
+    const currentCache = videoOverlayCacheRef.current;
+    
+    // Get all paths of video overlays that are enabled
+    const activePaths = new Set<string>();
+    if (config.videoOverlay?.enabled && config.videoOverlay?.items) {
+      config.videoOverlay.items.forEach(item => {
+        if (item.enabled && item.videoPath) {
+          activePaths.add(item.videoPath);
+        }
+      });
+    }
+    
+    // Clean up cache of paths that are no longer active
+    for (const key of Array.from(currentCache.keys())) {
+      if (!activePaths.has(key)) {
+        const video = currentCache.get(key);
+        if (video) {
+          try {
+            video.pause();
+            video.src = '';
+            video.load();
+          } catch (e) {}
+        }
+        currentCache.delete(key);
+      }
+    }
+    
+    // Load/update active videos
+    if (config.videoOverlay?.enabled && config.videoOverlay?.items) {
+      config.videoOverlay.items.forEach(item => {
+        if (item.enabled && item.videoPath) {
+          const path = item.videoPath;
+          if (!currentCache.has(path)) {
+            const video = document.createElement('video');
+            video.src = `/api/fs/file?path=${encodeURIComponent(path)}`;
+            video.muted = true;
+            video.loop = item.loop;
+            video.playsInline = true;
+            video.autoplay = true;
+            video.onloadeddata = () => {
+              video.play().catch((err) => console.log('Video overlay preview play error:', err));
+            };
+            currentCache.set(path, video);
+          } else {
+            const video = currentCache.get(path);
+            if (video) {
+              video.loop = item.loop;
+            }
+          }
+        }
+      });
+    }
+  }, [config.videoOverlay?.enabled, activeVideoOverlayDeps]);
+
+  // Auto-select first video overlay item if none selected
+  useEffect(() => {
+    if (!selectedVideoOverlayItemId && config.videoOverlay?.items && config.videoOverlay.items.length > 0) {
+      setSelectedVideoOverlayItemId(config.videoOverlay.items[0].id);
+    }
+  }, [config.videoOverlay?.items, selectedVideoOverlayItemId]);
+
+  // Load voice audio file duration when voiceFile changes
+  useEffect(() => {
+    if (!config.media.voiceFile) {
+      setVoiceDuration(0);
+      return;
+    }
+    const audioUrl = `/api/fs/file?path=${encodeURIComponent(config.media.voiceFile)}`;
+    const tempAudio = new Audio(audioUrl);
+    
+    const handleLoadedMetadata = () => {
+      setVoiceDuration(tempAudio.duration);
+    };
+    
+    const handleError = () => {
+      console.warn("Không thể tải thời lượng của tệp giọng đọc qua Web Audio. Có thể do đường dẫn không hợp lệ hoặc định dạng không được hỗ trợ.");
+      setVoiceDuration(0);
+    };
+
+    tempAudio.addEventListener('loadedmetadata', handleLoadedMetadata);
+    tempAudio.addEventListener('error', handleError);
+    
+    // Trigger loading
+    tempAudio.load();
+    
+    return () => {
+      tempAudio.removeEventListener('loadedmetadata', handleLoadedMetadata);
+      tempAudio.removeEventListener('error', handleError);
+    };
+  }, [config.media.voiceFile]);
 
   // Cycle through overlay images based on duration in frontend preview
   useEffect(() => {
@@ -233,7 +420,13 @@ export default function Page() {
       setActiveOverlayIdx(0);
       return;
     }
-    const durationMs = (config.imageOverlay.imageDuration || 5) * 1000;
+    
+    let imgDur = config.imageOverlay.imageDuration || 5;
+    if (config.imageOverlay.autoFitDuration && voiceDuration > 0 && config.media.overlayImages.length > 0) {
+      imgDur = voiceDuration / config.media.overlayImages.length;
+    }
+    
+    const durationMs = imgDur * 1000;
     const interval = setInterval(() => {
       setActiveOverlayIdx((prev) => {
         if (config.imageOverlay.randomImageOrder) {
@@ -244,7 +437,7 @@ export default function Page() {
       });
     }, durationMs);
     return () => clearInterval(interval);
-  }, [config.media.overlayImages, config.imageOverlay.imageDuration, config.imageOverlay.randomImageOrder, config.imageOverlay.enabled]);
+  }, [config.media.overlayImages, config.imageOverlay.imageDuration, config.imageOverlay.randomImageOrder, config.imageOverlay.enabled, config.imageOverlay.autoFitDuration, voiceDuration]);
 
   // Load presets on mount
   useEffect(() => {
@@ -400,6 +593,98 @@ export default function Page() {
     }
   };
 
+  // Handle preset exporting
+  const handleExportPreset = () => {
+    try {
+      const exportData = {
+        type: 'waveform_edit_preset',
+        version: '1.0',
+        name: selectedPresetName,
+        config: config
+      };
+      const jsonString = JSON.stringify(exportData, null, 2);
+      const blob = new Blob([jsonString], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      
+      const safeName = selectedPresetName.replace(/[^a-zA-Z0-9_\-]/g, '_');
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `waveform_preset_${safeName}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      console.error('Lỗi khi xuất preset:', error);
+      alert('Có lỗi xảy ra khi xuất cấu hình preset.');
+    }
+  };
+
+  // Handle preset importing
+  const handleImportPreset = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const content = event.target?.result as string;
+        const parsed = JSON.parse(content);
+        
+        let importedConfig: RenderConfig | null = null;
+        let suggestedName = file.name.replace(/\.json$/i, '');
+        
+        if (parsed && parsed.type === 'waveform_edit_preset' && parsed.config) {
+          importedConfig = parsed.config;
+          if (parsed.name) suggestedName = parsed.name;
+        } else if (parsed && (parsed.media || parsed.waveform || parsed.camera)) {
+          importedConfig = parsed;
+        }
+        
+        if (!importedConfig) {
+          alert('Tệp tin preset không hợp lệ hoặc sai định dạng!');
+          return;
+        }
+        
+        const presetName = prompt('Nhập tên cho Preset mới:', suggestedName);
+        if (!presetName || !presetName.trim()) {
+          return;
+        }
+        
+        const finalName = presetName.trim();
+        
+        const mergedConfig: RenderConfig = {
+          ...DEFAULT_PRESET,
+          ...importedConfig,
+          media: importedConfig.media ? { ...DEFAULT_PRESET.media, ...importedConfig.media } : DEFAULT_PRESET.media,
+          background: importedConfig.background ? { ...DEFAULT_PRESET.background, ...importedConfig.background } : DEFAULT_PRESET.background,
+          imageOverlay: importedConfig.imageOverlay ? { ...DEFAULT_PRESET.imageOverlay, ...importedConfig.imageOverlay } : DEFAULT_PRESET.imageOverlay,
+          videoOverlay: importedConfig.videoOverlay ? { ...DEFAULT_PRESET.videoOverlay, ...importedConfig.videoOverlay } : DEFAULT_PRESET.videoOverlay,
+          waveform: importedConfig.waveform ? { ...DEFAULT_PRESET.waveform, ...importedConfig.waveform } : DEFAULT_PRESET.waveform,
+          subtitles: importedConfig.subtitles ? { ...DEFAULT_PRESET.subtitles, ...importedConfig.subtitles } : DEFAULT_PRESET.subtitles,
+          camera: importedConfig.camera ? { ...DEFAULT_PRESET.camera, ...importedConfig.camera } : DEFAULT_PRESET.camera,
+          render: importedConfig.render ? { ...DEFAULT_PRESET.render, ...importedConfig.render } : DEFAULT_PRESET.render
+        };
+        
+        const success = presetStorage.savePreset(finalName, mergedConfig);
+        if (success) {
+          const updated = presetStorage.getPresets();
+          setPresets(updated);
+          setSelectedPresetName(finalName);
+          setConfig(mergedConfig);
+          alert(`Đã nhập thành công Preset "${finalName}"!`);
+        } else {
+          alert('Không thể lưu Preset đã nhập vào bộ nhớ!');
+        }
+      } catch (err) {
+        console.error('Lỗi khi đọc file preset:', err);
+        alert('Không thể đọc tệp tin preset. Định dạng JSON có thể bị lỗi.');
+      }
+      e.target.value = '';
+    };
+    reader.readAsText(file);
+  };
+
   const handleStartScanProjectMode = () => {
     setIsScanProjectMode(true);
     setBrowserField('voiceFile'); // placeholder to satisfy field validation
@@ -522,7 +807,7 @@ export default function Page() {
   };
 
   // Browser modal actions - actual selection
-  const openPathBrowser = (field: keyof RenderConfig['media'] | 'outputFilename' | 'subtitleFile' | 'rembgInputImage', mode: 'file' | 'dir') => {
+  const openPathBrowser = (field: keyof RenderConfig['media'] | 'outputFilename' | 'subtitleFile' | 'rembgInputImage' | 'videoOverlayPath' | 'addVideoOverlayPath', mode: 'file' | 'dir') => {
     setBrowserField(field);
     setBrowserMode(mode);
     setBrowserSearchQuery('');
@@ -550,6 +835,19 @@ export default function Page() {
     } else if (field === 'subtitleFile' && config.subtitles.subtitleFile) {
       const lastSlash = config.subtitles.subtitleFile.lastIndexOf('\\');
       if (lastSlash !== -1) initialPath = config.subtitles.subtitleFile.substring(0, lastSlash);
+    } else if (field === 'videoOverlayPath' || field === 'addVideoOverlayPath') {
+      let currentPath = '';
+      if (field === 'videoOverlayPath' && selectedVideoOverlayItemId) {
+        const item = (config.videoOverlay?.items || []).find(it => it.id === selectedVideoOverlayItemId);
+        if (item) currentPath = item.videoPath;
+      }
+      if (!currentPath && config.videoOverlay?.items && config.videoOverlay.items.length > 0) {
+        currentPath = config.videoOverlay.items[0].videoPath;
+      }
+      if (currentPath) {
+        const lastSlash = currentPath.lastIndexOf('\\');
+        if (lastSlash !== -1) initialPath = currentPath.substring(0, lastSlash);
+      }
     }
     
     setCurrentDirPath(initialPath);
@@ -587,9 +885,15 @@ export default function Page() {
         media: { ...config.media, musicFiles: [path] }
       });
     } else if (browserField === 'backgroundVideos') {
+      const currentBgVideos = [...config.media.backgroundVideos];
+      if (activeBgVideoIdxForBrowse !== null) {
+        currentBgVideos[activeBgVideoIdxForBrowse] = path;
+      } else {
+        currentBgVideos.push(path);
+      }
       setConfig({
         ...config,
-        media: { ...config.media, backgroundVideos: [path] } // select actual video
+        media: { ...config.media, backgroundVideos: currentBgVideos }
       });
     } else if (browserField === 'overlayImages') {
       const currentImages = config.media.overlayImages || [];
@@ -631,6 +935,109 @@ export default function Page() {
     } else if (browserField === 'rembgInputImage') {
       setRembgInputPath(path);
       setRembgResultPath('');
+    } else if (browserField === 'videoOverlayPath') {
+      if (selectedVideoOverlayItemId) {
+        const updated = (config.videoOverlay?.items || []).map(it =>
+          it.id === selectedVideoOverlayItemId ? { ...it, videoPath: path } : it
+        );
+        setConfig({
+          ...config,
+          videoOverlay: {
+            ...config.videoOverlay,
+            enabled: config.videoOverlay?.enabled ?? true,
+            items: updated
+          }
+        });
+      }
+    } else if (browserField === 'addVideoOverlayPath') {
+      const newId = `video_overlay_${Math.random().toString(36).substring(2, 9)}`;
+      const newItem = {
+        id: newId,
+        videoPath: path,
+        enabled: true,
+        x: 960,
+        y: 540,
+        width: 600,
+        height: 450,
+        opacity: 1.0,
+        chromaKeyEnabled: true,
+        chromaKeyColor: '#00ff00',
+        chromaKeySimilarity: 0.18,
+        chromaKeyBlend: 0.04,
+        loop: true,
+        repeatInterval: 0
+      };
+      const currentItems = config.videoOverlay?.items || [];
+      setConfig({
+        ...config,
+        videoOverlay: {
+          ...config.videoOverlay,
+          enabled: config.videoOverlay?.enabled ?? true,
+          items: [...currentItems, newItem]
+        }
+      });
+      setSelectedVideoOverlayItemId(newId);
+    }
+
+    setIsBrowserOpen(false);
+  };
+
+  const applySelectedPathsBulk = (paths: string[]) => {
+    if (!browserField || paths.length === 0) return;
+
+    if (browserField === 'overlayImages') {
+      const currentImages = config.media.overlayImages || [];
+      const newPaths = paths.filter(path => !currentImages.includes(path));
+      if (newPaths.length === 0) {
+        setIsBrowserOpen(false);
+        return;
+      }
+      
+      const updatedImages = [...currentImages, ...newPaths];
+      
+      const newItems = newPaths.map((path, index) => {
+        const newId = `overlay_${Math.random().toString(36).substring(2, 9)}_${Date.now()}_${index}`;
+        return {
+          id: newId,
+          imagePath: path,
+          enabled: true,
+          width: 400,
+          height: 300,
+          lockAspectRatio: true,
+          x: 960,
+          y: 540,
+          rotation: 0,
+          opacity: 0.9,
+          maskShape: 'circle' as const,
+          inset: 10,
+          feather: 0,
+          bounceEnabled: false
+        };
+      });
+      
+      const currentItems = config.imageOverlay.items || [];
+      setConfig({
+        ...config,
+        media: { ...config.media, overlayImages: updatedImages },
+        imageOverlay: {
+          ...config.imageOverlay,
+          items: [...currentItems, ...newItems]
+        }
+      });
+      if (newItems.length > 0) {
+        setSelectedOverlayItemId(newItems[newItems.length - 1].id);
+      }
+    } else if (browserField === 'backgroundVideos') {
+      const currentBgVideos = config.media.backgroundVideos || [];
+      const newPaths = paths.filter(path => !currentBgVideos.includes(path));
+      if (newPaths.length === 0) {
+        setIsBrowserOpen(false);
+        return;
+      }
+      setConfig({
+        ...config,
+        media: { ...config.media, backgroundVideos: [...currentBgVideos, ...newPaths] }
+      });
     }
 
     setIsBrowserOpen(false);
@@ -919,7 +1326,12 @@ export default function Page() {
     const h = canvas.height;
 
     // 1. Draw Background (Video or default spheres)
-    if (bgVideoRef.current && bgVideoRef.current.readyState >= 2) {
+    const activeBgVideos = (config.media.backgroundVideos || []).filter(Boolean).slice(0, 4);
+    const loadedBgVideos = activeBgVideos
+      .map(path => bgVideosCacheRef.current.get(path))
+      .filter((video): video is HTMLVideoElement => !!video && video.readyState >= 2);
+
+    if (loadedBgVideos.length > 0) {
       ctx.save();
       
       // Black background for letterboxing pad bars
@@ -930,27 +1342,290 @@ export default function Page() {
         ctx.filter = `blur(${Math.round(config.background.blurPercent * 0.15)}px)`;
       }
       
-      // Scale video keeping aspect ratio to fit (matching FFmpeg's force_original_aspect_ratio=decrease)
-      const videoW = bgVideoRef.current.videoWidth;
-      const videoH = bgVideoRef.current.videoHeight;
-      const videoAspect = videoW / videoH;
-      const canvasAspect = w / h;
+      const numBg = loadedBgVideos.length;
+      const bgLayout = config.background.layout || 'columns';
+      const seamStyle = config.background.seamOverlay || 'shadow';
+
+      // Scale feather width from output resolution to preview canvas size
+      const resStr = config.render.resolution || '1920x1080';
+      let resW = 1920;
+      try {
+        const parts = resStr.split('x').map(Number);
+        if (parts.length === 2 && !isNaN(parts[0])) {
+          resW = parts[0];
+        }
+      } catch (e) {}
+      const scaleFactor = w / resW;
+      const baseFeather = config.background.featherWidth ?? 80;
+      const fWidth = baseFeather * scaleFactor;
+
+      loadedBgVideos.forEach((video, i) => {
+        let w_slot = 0, h_slot = 0, x_pos = 0, y_pos = 0;
+        
+        if (bgLayout === 'columns') {
+          h_slot = h;
+          y_pos = 0;
+          if (seamStyle === 'feather') {
+            const colW = Math.floor(w / numBg);
+            const left_seam = i > 0 ? i * colW : 0;
+            const right_seam = i < numBg - 1 ? (i + 1) * colW : w;
+            x_pos = i > 0 ? (left_seam - fWidth / 2) : 0;
+            const x_end = i < numBg - 1 ? (right_seam + fWidth) : w;
+            w_slot = x_end - x_pos;
+          } else {
+            w_slot = i < numBg - 1 ? Math.floor(w / numBg) : (w - i * Math.floor(w / numBg));
+            x_pos = i * Math.floor(w / numBg);
+          }
+        } else if (bgLayout === 'rows') {
+          w_slot = w;
+          x_pos = 0;
+          if (seamStyle === 'feather') {
+            const rowH = Math.floor(h / numBg);
+            const top_seam = i > 0 ? i * rowH : 0;
+            const bottom_seam = i < numBg - 1 ? (i + 1) * rowH : h;
+            y_pos = i > 0 ? (top_seam - fWidth / 2) : 0;
+            const y_end = i < numBg - 1 ? (bottom_seam + fWidth) : h;
+            h_slot = y_end - y_pos;
+          } else {
+            h_slot = i < numBg - 1 ? Math.floor(h / numBg) : (h - i * Math.floor(h / numBg));
+            y_pos = i * Math.floor(h / numBg);
+          }
+        } else { // 'grid'
+          const halfW = Math.floor(w / 2);
+          const halfH = Math.floor(h / 2);
+          if (numBg === 2) {
+            if (seamStyle === 'feather') {
+              x_pos = i === 0 ? 0 : halfW - fWidth / 2;
+              const x_end = i === 0 ? halfW + fWidth : w;
+              w_slot = x_end - x_pos;
+            } else {
+              w_slot = i === 0 ? halfW : (w - halfW);
+              x_pos = i * halfW;
+            }
+            h_slot = h;
+            y_pos = 0;
+          } else if (numBg === 3) {
+            if (i === 0) {
+              x_pos = 0;
+              y_pos = 0;
+              w_slot = halfW + (seamStyle === 'feather' ? fWidth : 0);
+              h_slot = halfH + (seamStyle === 'feather' ? fWidth : 0);
+            } else if (i === 1) {
+              x_pos = halfW - (seamStyle === 'feather' ? fWidth / 2 : 0);
+              y_pos = 0;
+              w_slot = w - x_pos;
+              h_slot = halfH + (seamStyle === 'feather' ? fWidth : 0);
+            } else {
+              x_pos = 0;
+              y_pos = halfH - (seamStyle === 'feather' ? fWidth / 2 : 0);
+              w_slot = w;
+              h_slot = h - y_pos;
+            }
+          } else { // 4 videos grid
+            const isLeft = (i === 0 || i === 2);
+            const isTop = (i === 0 || i === 1);
+            x_pos = isLeft ? 0 : halfW - (seamStyle === 'feather' ? fWidth / 2 : 0);
+            y_pos = isTop ? 0 : halfH - (seamStyle === 'feather' ? fWidth / 2 : 0);
+            const x_end = isLeft ? halfW + (seamStyle === 'feather' ? fWidth : 0) : w;
+            const y_end = isTop ? halfH + (seamStyle === 'feather' ? fWidth : 0) : h;
+            w_slot = x_end - x_pos;
+            h_slot = y_end - y_pos;
+          }
+        }
+        
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(x_pos, y_pos, w_slot, h_slot);
+        ctx.clip();
+        
+        const videoW = video.videoWidth;
+        const videoH = video.videoHeight;
+        const videoAspect = videoW / videoH;
+        const slotAspect = w_slot / h_slot;
+        
+        let drawW = w_slot;
+        let drawH = h_slot;
+        let dx = x_pos;
+        let dy = y_pos;
+        
+        if (videoAspect > slotAspect) {
+          drawW = h_slot * videoAspect;
+          dx = x_pos + (w_slot - drawW) / 2;
+        } else {
+          drawH = w_slot / videoAspect;
+          dy = y_pos + (h_slot - drawH) / 2;
+        }
+        
+        if (seamStyle === 'feather' && i > 0) {
+          if (!offscreenCanvasRef.current) {
+            offscreenCanvasRef.current = document.createElement('canvas');
+          }
+          const offscreen = offscreenCanvasRef.current;
+          offscreen.width = w_slot;
+          offscreen.height = h_slot;
+          const octx = offscreen.getContext('2d');
+          if (octx) {
+            octx.clearRect(0, 0, w_slot, h_slot);
+            
+            let needLeftFade = false;
+            let needTopFade = false;
+            
+            if (bgLayout === 'columns') {
+              needLeftFade = true;
+            } else if (bgLayout === 'rows') {
+              needTopFade = true;
+            } else { // 'grid'
+              if (numBg === 2) {
+                needLeftFade = true;
+              } else if (numBg === 3) {
+                if (i === 1) needLeftFade = true;
+                if (i === 2) needTopFade = true;
+              } else { // 4
+                if (i === 1 || i === 3) needLeftFade = true;
+                if (i === 2 || i === 3) needTopFade = true;
+              }
+            }
+            
+            // 1. Draw horizontal mask if needed
+            if (needLeftFade && fWidth > 0) {
+              octx.save();
+              const gradL = octx.createLinearGradient(0, 0, fWidth, 0);
+              gradL.addColorStop(0, 'rgba(0,0,0,0)');
+              gradL.addColorStop(1, 'rgba(0,0,0,1)');
+              octx.fillStyle = gradL;
+              octx.fillRect(0, 0, fWidth, h_slot);
+              octx.fillStyle = 'rgba(0,0,0,1)';
+              octx.fillRect(fWidth, 0, w_slot - fWidth, h_slot);
+              octx.restore();
+            }
+            
+            // 2. Draw vertical mask if needed
+            if (needTopFade && fWidth > 0) {
+              octx.save();
+              if (needLeftFade) {
+                octx.globalCompositeOperation = 'destination-in';
+              }
+              const gradT = octx.createLinearGradient(0, 0, 0, fWidth);
+              gradT.addColorStop(0, 'rgba(0,0,0,0)');
+              gradT.addColorStop(1, 'rgba(0,0,0,1)');
+              octx.fillStyle = gradT;
+              octx.fillRect(0, 0, w_slot, fWidth);
+              octx.fillStyle = 'rgba(0,0,0,1)';
+              octx.fillRect(0, fWidth, w_slot, h_slot - fWidth);
+              octx.restore();
+              
+              if (needLeftFade) {
+                octx.globalCompositeOperation = 'source-over';
+              }
+            }
+            
+            // 3. Draw the video on top using 'source-in' composite mode
+            octx.save();
+            octx.globalCompositeOperation = 'source-in';
+            const odx = dx - x_pos;
+            const ody = dy - y_pos;
+            octx.drawImage(video, odx, ody, drawW, drawH);
+            octx.restore();
+            
+            // Reset composite operation on the offscreen canvas for safety
+            octx.globalCompositeOperation = 'source-over';
+            
+            // Draw offscreen onto main canvas
+            ctx.drawImage(offscreen, x_pos, y_pos);
+          }
+        } else {
+          ctx.drawImage(video, dx, dy, drawW, drawH);
+        }
+        ctx.restore();
+      });
       
-      let drawW = w;
-      let drawH = h;
-      let dx = 0;
-      let dy = 0;
-      
-      if (videoAspect > canvasAspect) {
-        drawH = w / videoAspect;
-        dy = (h - drawH) / 2;
-      } else {
-        drawW = h * videoAspect;
-        dx = (w - drawW) / 2;
-      }
-      
-      ctx.drawImage(bgVideoRef.current, dx, dy, drawW, drawH);
       ctx.restore();
+
+      // Draw Seam Dividers
+      const seamColor = config.background.seamGlowColor || '#8b5cf6';
+      
+      if (numBg > 1 && seamStyle !== 'none' && seamStyle !== 'feather') {
+        ctx.save();
+        const seams: {x1: number, y1: number, x2: number, y2: number}[] = [];
+        if (bgLayout === 'columns') {
+          for (let i = 1; i < numBg; i++) {
+            const x = i * Math.floor(w / numBg);
+            seams.push({x1: x, y1: 0, x2: x, y2: h});
+          }
+        } else if (bgLayout === 'rows') {
+          for (let i = 1; i < numBg; i++) {
+            const y = i * Math.floor(h / numBg);
+            seams.push({x1: 0, y1: y, x2: w, y2: y});
+          }
+        } else if (bgLayout === 'grid') {
+          if (numBg === 4) {
+            seams.push({x1: Math.floor(w / 2), y1: 0, x2: Math.floor(w / 2), y2: h});
+            seams.push({x1: 0, y1: Math.floor(h / 2), x2: w, y2: Math.floor(h / 2)});
+          } else if (numBg === 3) {
+            seams.push({x1: 0, y1: Math.floor(h / 2), x2: w, y2: Math.floor(h / 2)});
+            seams.push({x1: Math.floor(w / 2), y1: 0, x2: Math.floor(w / 2), y2: Math.floor(h / 2)});
+          } else {
+            seams.push({x1: Math.floor(w / 2), y1: 0, x2: Math.floor(w / 2), y2: h});
+          }
+        }
+        
+        seams.forEach(s => {
+          // 1. Draw solid line at the exact center to 100% cover the video cuts
+          ctx.save();
+          ctx.strokeStyle = seamStyle === 'shadow' ? '#000000' : seamColor;
+          if (seamStyle === 'neon') {
+            ctx.strokeStyle = seamColor; // colored glow base
+          }
+          ctx.lineWidth = 4;
+          ctx.beginPath();
+          ctx.moveTo(s.x1, s.y1);
+          ctx.lineTo(s.x2, s.y2);
+          ctx.stroke();
+          ctx.restore();
+
+          // 2. Draw soft gradient overlay on top (80px wide) to fade out and hide solid line edges
+          ctx.save();
+          if (seamStyle === 'shadow') {
+            const grad = s.x1 === s.x2 
+              ? ctx.createLinearGradient(s.x1 - 40, 0, s.x1 + 40, 0)
+              : ctx.createLinearGradient(0, s.y1 - 40, 0, s.y1 + 40);
+            grad.addColorStop(0, 'rgba(0,0,0,0)');
+            grad.addColorStop(0.5, 'rgba(0,0,0,0.95)');
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = grad;
+            if (s.x1 === s.x2) {
+              ctx.fillRect(s.x1 - 40, 0, 80, h);
+            } else {
+              ctx.fillRect(0, s.y1 - 40, w, 80);
+            }
+          } else if (seamStyle === 'glow' || seamStyle === 'neon') {
+            const grad = s.x1 === s.x2 
+              ? ctx.createLinearGradient(s.x1 - 40, 0, s.x1 + 40, 0)
+              : ctx.createLinearGradient(0, s.y1 - 40, 0, s.y1 + 40);
+            grad.addColorStop(0, 'rgba(0,0,0,0)');
+            grad.addColorStop(0.5, seamColor + 'bb');
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            ctx.fillStyle = grad;
+            if (s.x1 === s.x2) {
+              ctx.fillRect(s.x1 - 40, 0, 80, h);
+            } else {
+              ctx.fillRect(0, s.y1 - 40, w, 80);
+            }
+            
+            // 3. For neon, draw a sharp bright core line on top of the glow
+            if (seamStyle === 'neon') {
+              ctx.strokeStyle = '#ffffff';
+              ctx.lineWidth = 2;
+              ctx.beginPath();
+              ctx.moveTo(s.x1, s.y1);
+              ctx.lineTo(s.x2, s.y2);
+              ctx.stroke();
+            }
+          }
+          ctx.restore();
+        });
+        ctx.restore();
+      }
     } else {
       ctx.fillStyle = '#0a0d1a';
       ctx.fillRect(0, 0, w, h);
@@ -1000,7 +1675,7 @@ export default function Page() {
       if (!config.imageOverlay.enabled) return;
 
       const drawSingleLayer = (
-        imgElement: HTMLImageElement | null,
+        imgElement: HTMLImageElement | HTMLCanvasElement | null,
         cfgX: number,
         cfgY: number,
         cfgW: number,
@@ -1009,7 +1684,12 @@ export default function Page() {
         cfgOpacity: number,
         cfgShape: string,
         cfgFeather: number,
-        cfgBounce: boolean
+        cfgRoundCorners: number,
+        cfgBounce: boolean,
+        borderEnabled?: boolean,
+        borderWidth?: number,
+        borderColor?: string,
+        cfgInset: number = 10
       ) => {
         ctx.save();
         
@@ -1024,64 +1704,143 @@ export default function Page() {
           bounceScale = 1.0 + 0.12 * Math.max(0, rawAmp);
         }
 
-        const imgW = (cfgW / 1920) * w * bounceScale;
-        const imgH = (cfgH / 1080) * h * bounceScale;
+        const scaleFactor = (w / 1920) * bounceScale;
+        const imgW = cfgW * scaleFactor;
+        const imgH = cfgH * scaleFactor;
 
         ctx.translate(overlayX, overlayY);
         ctx.rotate((cfgRotation * Math.PI) / 180);
         
-        ctx.beginPath();
-        if (cfgShape === 'circle') {
-          ctx.arc(0, 0, Math.min(imgW, imgH) / 2, 0, Math.PI * 2);
-        } else if (cfgShape === 'hexagon') {
-          const r = Math.min(imgW, imgH) / 2;
-          for (let i = 0; i < 6; i++) {
-            const angle = (i * Math.PI) / 3 - Math.PI / 6;
-            ctx.lineTo(r * Math.cos(angle), r * Math.sin(angle));
+        const drawRoundRectPathLocal = (c: CanvasRenderingContext2D, rx: number, ry: number, rw: number, rh: number, rr: number) => {
+          if (rr <= 0) {
+            c.rect(rx, ry, rw, rh);
+            return;
           }
-          ctx.closePath();
-        } else if (cfgShape === 'rect_3_4') {
-          const rW = imgH * (3/4);
-          ctx.rect(-rW / 2, -imgH / 2, rW, imgH);
-        } else if (cfgShape === 'rect_4_3') {
-          const rH = imgW * (3/4);
-          ctx.rect(-imgW / 2, -rH / 2, imgW, rH);
-        } else if (cfgShape === 'square') {
-          const r = Math.min(imgW, imgH);
-          ctx.rect(-r / 2, -r / 2, r, r);
-        } else {
-          ctx.rect(-imgW / 2, -imgH / 2, imgW, imgH);
-        }
+          if (rw < 2 * rr) rr = rw / 2;
+          if (rh < 2 * rr) rr = rh / 2;
+          if (typeof c.roundRect === 'function') {
+            c.roundRect(rx, ry, rw, rh, rr);
+          } else {
+            c.moveTo(rx + rr, ry);
+            c.arcTo(rx + rw, ry, rx + rw, ry + rh, rr);
+            c.arcTo(rx + rw, ry + rh, rx, ry + rh, rr);
+            c.arcTo(rx, ry + rh, rx, ry, rr);
+            c.arcTo(rx, ry, rx + rw, ry, rr);
+          }
+        };
+
+        const setShapePath = (c: CanvasRenderingContext2D, targetW: number, targetH: number, insetVal: number) => {
+          c.beginPath();
+          if (cfgShape === 'circle') {
+            const r = Math.min(targetW, targetH) / 2;
+            c.arc(0, 0, Math.max(0, r - insetVal), 0, Math.PI * 2);
+          } else if (cfgShape === 'hexagon') {
+            const r = Math.max(0, Math.min(targetW, targetH) / 2 - insetVal);
+            for (let i = 0; i < 6; i++) {
+              const angle = (i * Math.PI) / 3 - Math.PI / 6;
+              c.lineTo(r * Math.cos(angle), r * Math.sin(angle));
+            }
+            c.closePath();
+          } else if (cfgShape === 'rect_3_4') {
+            const rW = targetH * (3/4);
+            const mappedRadius = cfgRoundCorners * scaleFactor;
+            drawRoundRectPathLocal(c, -rW / 2 + insetVal, -targetH / 2 + insetVal, Math.max(0, rW - insetVal * 2), Math.max(0, targetH - insetVal * 2), mappedRadius);
+          } else if (cfgShape === 'rect_4_3') {
+            const rH = targetW * (3/4);
+            const mappedRadius = cfgRoundCorners * scaleFactor;
+            drawRoundRectPathLocal(c, -targetW / 2 + insetVal, -rH / 2 + insetVal, Math.max(0, targetW - insetVal * 2), Math.max(0, rH - insetVal * 2), mappedRadius);
+          } else if (cfgShape === 'square') {
+            const r = Math.min(targetW, targetH);
+            const mappedRadius = cfgRoundCorners * scaleFactor;
+            drawRoundRectPathLocal(c, -r / 2 + insetVal, -r / 2 + insetVal, Math.max(0, r - insetVal * 2), Math.max(0, r - insetVal * 2), mappedRadius);
+          } else {
+            const mappedRadius = cfgRoundCorners * scaleFactor;
+            drawRoundRectPathLocal(c, -targetW / 2 + insetVal, -targetH / 2 + insetVal, Math.max(0, targetW - insetVal * 2), Math.max(0, targetH - insetVal * 2), mappedRadius);
+          }
+        };
+
+        const canvasInset = cfgInset * scaleFactor;
+        const canvasFeather = cfgFeather * scaleFactor;
 
         ctx.globalAlpha = cfgOpacity;
 
         if (imgElement) {
-          ctx.clip();
-          // Calculate cropping area to preserve original aspect ratio (Simulating Pillow's ImageOps.fit)
-          const imgAspect = imgElement.width / imgElement.height;
-          const targetAspect = imgW / imgH;
-          let sx = 0, sy = 0, sw = imgElement.width, sh = imgElement.height;
+          ctx.save();
           
-          if (imgAspect > targetAspect) {
-            // Source image is wider than target area
-            sw = imgElement.height * targetAspect;
-            sx = (imgElement.width - sw) / 2;
+          if (canvasFeather > 0) {
+            // Draw using offscreen feathered mask
+            const offscreen = document.createElement('canvas');
+            offscreen.width = imgW;
+            offscreen.height = imgH;
+            const octx = offscreen.getContext('2d')!;
+            
+            // Draw blurred mask shape
+            const maxInset = Math.max(0, Math.min(imgW, imgH) / 2 - 2);
+            const totalInset = Math.min(canvasInset + canvasFeather * 2.5, maxInset);
+
+            octx.filter = `blur(${canvasFeather}px)`;
+            octx.fillStyle = 'white';
+            octx.translate(imgW / 2, imgH / 2);
+            setShapePath(octx, imgW, imgH, totalInset);
+            octx.fill();
+            
+            // Draw image on top of mask with source-in composite
+            octx.filter = 'none';
+            octx.globalCompositeOperation = 'source-in';
+            octx.translate(-imgW / 2, -imgH / 2);
+            
+            const imgAspect = imgElement.width / imgElement.height;
+            const targetAspect = imgW / imgH;
+            let sx = 0, sy = 0, sw = imgElement.width, sh = imgElement.height;
+            if (imgAspect > targetAspect) {
+              sw = imgElement.height * targetAspect;
+              sx = (imgElement.width - sw) / 2;
+            } else {
+              sh = imgElement.width / targetAspect;
+              sy = (imgElement.height - sh) / 2;
+            }
+            octx.drawImage(imgElement, sx, sy, sw, sh, 0, 0, imgW, imgH);
+            
+            // Draw feathered result
+            ctx.drawImage(offscreen, -imgW / 2, -imgH / 2);
           } else {
-            // Source image is taller than target area
-            sh = imgElement.width / targetAspect;
-            sy = (imgElement.height - sh) / 2;
+            setShapePath(ctx, imgW, imgH, canvasInset);
+            ctx.clip();
+            const imgAspect = imgElement.width / imgElement.height;
+            const targetAspect = imgW / imgH;
+            let sx = 0, sy = 0, sw = imgElement.width, sh = imgElement.height;
+            if (imgAspect > targetAspect) {
+              sw = imgElement.height * targetAspect;
+              sx = (imgElement.width - sw) / 2;
+            } else {
+              sh = imgElement.width / targetAspect;
+              sy = (imgElement.height - sh) / 2;
+            }
+            ctx.drawImage(imgElement, sx, sy, sw, sh, -imgW / 2, -imgH / 2, imgW, imgH);
           }
-          ctx.drawImage(imgElement, sx, sy, sw, sh, -imgW / 2, -imgH / 2, imgW, imgH);
+          ctx.restore();
+          
+          // Draw Border on top if enabled
+          if (borderEnabled) {
+            ctx.save();
+            ctx.strokeStyle = borderColor || '#ffffff';
+            const bWidth = ((borderWidth ?? 8) / 1920) * w;
+            ctx.lineWidth = bWidth;
+            setShapePath(ctx, imgW, imgH, canvasInset);
+            ctx.stroke();
+            ctx.restore();
+          }
         } else {
           ctx.fillStyle = 'rgba(139, 92, 246, 0.15)'; 
+          setShapePath(ctx, imgW, imgH, canvasInset);
           ctx.fill();
           ctx.strokeStyle = '#8b5cf6';
           ctx.lineWidth = 2;
           ctx.stroke();
 
-          if (cfgFeather > 0) {
+          if (canvasFeather > 0) {
             ctx.shadowColor = '#8b5cf6';
-            ctx.shadowBlur = cfgFeather;
+            ctx.shadowBlur = canvasFeather;
             ctx.stroke();
           }
 
@@ -1110,7 +1869,12 @@ export default function Page() {
             item.opacity,
             item.maskShape,
             item.feather,
-            item.bounceEnabled || false
+            item.roundCorners || 0,
+            item.bounceEnabled || false,
+            item.borderEnabled,
+            item.borderWidth,
+            item.borderColor,
+            item.inset !== undefined ? item.inset : 10
           );
         });
         return;
@@ -1127,7 +1891,12 @@ export default function Page() {
         config.imageOverlay.opacity,
         config.imageOverlay.maskShape,
         config.imageOverlay.feather,
-        config.imageOverlay.bounceEnabled || false
+        config.imageOverlay.roundCorners || 0,
+        config.imageOverlay.bounceEnabled || false,
+        config.imageOverlay.borderEnabled,
+        config.imageOverlay.borderWidth,
+        config.imageOverlay.borderColor,
+        config.imageOverlay.inset !== undefined ? config.imageOverlay.inset : 10
       );
     };
 
@@ -1459,6 +2228,117 @@ export default function Page() {
       ctx.restore();
     };
 
+    const drawVideoOverlay = () => {
+      if (!config.videoOverlay?.enabled || !config.videoOverlay.items) return;
+      
+      config.videoOverlay.items.forEach(item => {
+        if (!item.enabled || !item.videoPath) return;
+        const path = item.videoPath;
+        
+        const video = videoOverlayCacheRef.current.get(path);
+        if (!video || video.readyState < 2) return;
+
+        const repeatVal = item.repeatInterval || 0;
+        if (repeatVal > 0) {
+          const intervalSec = repeatVal * 60;
+          const durationSec = video.duration || 5;
+          const currentTimeInSec = (Date.now() / 1000) % intervalSec;
+          if (currentTimeInSec >= durationSec) {
+            if (!video.paused) {
+              try {
+                video.pause();
+                video.currentTime = 0;
+              } catch (e) {}
+            }
+            return;
+          } else {
+            if (video.paused) {
+              video.play().catch(() => {});
+            }
+          }
+        } else {
+          if (video.paused) {
+            video.play().catch(() => {});
+          }
+        }
+        
+        ctx.save();
+        
+        const overlayX = ((item.x ?? 960) / 1920) * w;
+        const overlayY = ((item.y ?? 800) / 1080) * h;
+        const imgW = ((item.width ?? 600) / 1920) * w;
+        const imgH = ((item.height ?? 180) / 1080) * h;
+        
+        if (!videoOverlayOffscreenRef.current) {
+          videoOverlayOffscreenRef.current = document.createElement('canvas');
+        }
+        const offscreen = videoOverlayOffscreenRef.current;
+        const roundW = Math.max(1, Math.round(imgW));
+        const roundH = Math.max(1, Math.round(imgH));
+        if (offscreen.width !== roundW || offscreen.height !== roundH) {
+          offscreen.width = roundW;
+          offscreen.height = roundH;
+        }
+        
+        const octx = offscreen.getContext('2d', { willReadFrequently: true });
+        if (!octx) {
+          ctx.restore();
+          return;
+        }
+        
+        octx.clearRect(0, 0, roundW, roundH);
+        octx.drawImage(video, 0, 0, roundW, roundH);
+        
+        if (item.chromaKeyEnabled) {
+          const imgData = octx.getImageData(0, 0, roundW, roundH);
+          const data = imgData.data;
+          
+          const hex = item.chromaKeyColor || '#00ff00';
+          const clean = hex.replace(/^#/, '');
+          const bigint = parseInt(clean, 16) || 0;
+          const tr = (bigint >> 16) & 255;
+          const tg = (bigint >> 8) & 255;
+          const tb = bigint & 255;
+          
+          const similarity = item.chromaKeySimilarity ?? 0.18;
+          const blend = item.chromaKeyBlend ?? 0.04;
+          
+          const isGreenKey = tg > 150 && tr < 100 && tb < 100;
+          
+          for (let i = 0; i < data.length; i += 4) {
+            const r = data[i];
+            const g = data[i+1];
+            const b = data[i+2];
+            const a = data[i+3];
+            
+            const rd = (r - tr) / 255;
+            const gd = (g - tg) / 255;
+            const bd = (b - tb) / 255;
+            const dist = Math.sqrt(rd*rd + gd*gd + bd*bd);
+            
+            if (dist < similarity) {
+              data[i+3] = 0;
+            } else if (dist < similarity + blend && blend > 0) {
+              const factor = (dist - similarity) / blend;
+              data[i+3] = Math.min(a, Math.round(255 * factor));
+            }
+            
+            if (isGreenKey && data[i+3] > 0) {
+              const rbAvg = Math.floor((r + b) / 2);
+              if (g > rbAvg) {
+                data[i+1] = rbAvg;
+              }
+            }
+          }
+          octx.putImageData(imgData, 0, 0);
+        }
+        
+        ctx.globalAlpha = item.opacity !== undefined ? item.opacity : 1.0;
+        ctx.drawImage(offscreen, overlayX - imgW / 2, overlayY - imgH / 2, imgW, imgH);
+        ctx.restore();
+      });
+    };
+
     // Thực hiện vẽ theo Z-index mong muốn (layerOrder) để mang ra trước/sau
     const layerOrder = config.waveform.layerOrder || 'waveform_on_top';
     if (layerOrder === 'image_on_top') {
@@ -1468,6 +2348,8 @@ export default function Page() {
       drawImageOverlay();
       drawWaveform();
     }
+
+    drawVideoOverlay();
 
     // 4. Subtitles
     if (config.subtitles.enabled) {
@@ -2100,7 +2982,82 @@ export default function Page() {
                 ))}
               </select>
             </div>
-            
+
+            <div style={{ height: '14px', width: '1px', background: 'var(--border-light)' }}></div>
+
+            {/* Import & Export actions */}
+            <div style={{ display: 'flex', gap: '6px' }}>
+              <button
+                onClick={() => document.getElementById('import-preset-file-input')?.click()}
+                title="Nhập Preset từ file JSON"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                  padding: '4px 8px',
+                  borderRadius: '4px',
+                  border: '1px solid rgba(99, 102, 241, 0.3)',
+                  background: 'rgba(99, 102, 241, 0.08)',
+                  color: '#818cf8',
+                  cursor: 'pointer',
+                  fontSize: '11px',
+                  fontFamily: 'var(--font-mono)',
+                  fontWeight: '700',
+                  transition: 'all 200ms ease'
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = '#6366f1';
+                  e.currentTarget.style.color = '#ffffff';
+                  e.currentTarget.style.borderColor = 'transparent';
+                  e.currentTarget.style.boxShadow = '0 0 10px rgba(99, 102, 241, 0.4)';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = 'rgba(99, 102, 241, 0.08)';
+                  e.currentTarget.style.borderColor = 'rgba(99, 102, 241, 0.3)';
+                  e.currentTarget.style.color = '#818cf8';
+                  e.currentTarget.style.boxShadow = 'none';
+                }}
+              >
+                <Upload size={11} />
+                Nhập
+              </button>
+
+              <button
+                onClick={handleExportPreset}
+                title="Xuất cấu hình hiện tại ra file JSON"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '4px',
+                  padding: '4px 8px',
+                  borderRadius: '4px',
+                  border: '1px solid rgba(139, 92, 246, 0.3)',
+                  background: 'rgba(139, 92, 246, 0.08)',
+                  color: '#a78bfa',
+                  cursor: 'pointer',
+                  fontSize: '11px',
+                  fontFamily: 'var(--font-mono)',
+                  fontWeight: '700',
+                  transition: 'all 200ms ease'
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = 'var(--neon-purple)';
+                  e.currentTarget.style.color = '#ffffff';
+                  e.currentTarget.style.borderColor = 'transparent';
+                  e.currentTarget.style.boxShadow = '0 0 10px rgba(139, 92, 246, 0.4)';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = 'rgba(139, 92, 246, 0.08)';
+                  e.currentTarget.style.borderColor = 'rgba(139, 92, 246, 0.3)';
+                  e.currentTarget.style.color = '#a78bfa';
+                  e.currentTarget.style.boxShadow = 'none';
+                }}
+              >
+                <Download size={11} />
+                Xuất
+              </button>
+            </div>
+
             {selectedPresetName !== 'Mặc định' && (
               <div style={{ height: '14px', width: '1px', background: 'var(--border-light)' }}></div>
             )}
@@ -2510,48 +3467,105 @@ export default function Page() {
                 </div>
                 
                 <div className="form-group">
-                  <label className="form-label" style={{ color: '#ffffff', fontFamily: 'var(--font-mono)', fontSize: '12px', letterSpacing: '0.5px' }}>
-                    VIDEO NỀN (BACKGROUNDVIDEOS)
+                  <label className="form-label" style={{ color: '#ffffff', fontFamily: 'var(--font-mono)', fontSize: '12px', letterSpacing: '0.5px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span>DANH SÁCH VIDEO NỀN (BACKGROUND VIDEOS - TỐI ĐA 4)</span>
+                    {config.media.backgroundVideos.length < 4 && (
+                      <button
+                        onClick={() => {
+                          const updated = [...config.media.backgroundVideos, ''];
+                          setConfig({
+                            ...config,
+                            media: { ...config.media, backgroundVideos: updated }
+                          });
+                        }}
+                        style={{
+                          padding: '4px 10px',
+                          borderRadius: '4px',
+                          border: '1px dashed var(--border-neon)',
+                          background: 'rgba(225, 29, 72, 0.04)',
+                          color: 'var(--neon-rose)',
+                          cursor: 'pointer',
+                          fontSize: '11px',
+                          fontFamily: 'var(--font-mono)'
+                        }}
+                      >
+                        + THÊM VIDEO NỀN
+                      </button>
+                    )}
                   </label>
-                  <div style={{ display: 'flex', gap: '8px' }}>
-                    <input
-                      type="text"
-                      value={config.media.backgroundVideos.join(', ')}
-                      readOnly
-                      className="form-input"
-                      style={{ flex: 1, color: '#38bdf8', fontWeight: 'bold', fontFamily: 'var(--font-mono)', fontSize: '13px' }}
-                    />
-                    <button
-                      onClick={() => openPathBrowser('backgroundVideos', 'file')}
-                      style={{
-                        padding: '10px 18px',
-                        borderRadius: '8px',
-                        border: '1px solid var(--border-neon)',
-                        background: 'rgba(225, 29, 72, 0.08)',
-                        color: 'var(--neon-rose)',
-                        cursor: 'pointer',
-                        fontSize: '13px',
-                        fontFamily: 'var(--font-mono)',
-                        fontWeight: '700',
-                        boxShadow: '0 0 10px rgba(225, 29, 72, 0.1)',
-                        transition: 'all 200ms ease'
-                      }}
-                      onMouseEnter={(e) => {
-                        e.currentTarget.style.background = 'linear-gradient(135deg, var(--neon-rose), var(--neon-purple))';
-                        e.currentTarget.style.color = '#ffffff';
-                        e.currentTarget.style.borderColor = 'transparent';
-                        e.currentTarget.style.boxShadow = '0 0 15px rgba(225, 29, 72, 0.45)';
-                      }}
-                      onMouseLeave={(e) => {
-                        e.currentTarget.style.background = 'rgba(225, 29, 72, 0.08)';
-                        e.currentTarget.style.borderColor = 'var(--border-neon)';
-                        e.currentTarget.style.color = 'var(--neon-rose)';
-                        e.currentTarget.style.boxShadow = '0 0 10px rgba(225, 29, 72, 0.1)';
-                      }}
-                    >
-                      Duyệt tệp...
-                    </button>
-                  </div>
+
+                  {config.media.backgroundVideos.map((videoPath, idx) => (
+                    <div key={idx} style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
+                      <span style={{ 
+                        display: 'flex', 
+                        alignItems: 'center', 
+                        justifyContent: 'center',
+                        width: '28px',
+                        backgroundColor: 'rgba(255,255,255,0.05)',
+                        border: '1px solid var(--border-light)',
+                        borderRadius: '6px',
+                        fontSize: '11px',
+                        color: 'var(--text-muted)',
+                        fontWeight: 'bold',
+                        fontFamily: 'var(--font-mono)'
+                      }}>
+                        {idx + 1}
+                      </span>
+                      <input
+                        type="text"
+                        value={videoPath}
+                        readOnly
+                        placeholder="Chưa chọn tệp video nền..."
+                        className="form-input"
+                        style={{ flex: 1, color: '#38bdf8', fontWeight: 'bold', fontFamily: 'var(--font-mono)', fontSize: '13px' }}
+                      />
+                      <button
+                        onClick={() => {
+                          setActiveBgVideoIdxForBrowse(idx);
+                          openPathBrowser('backgroundVideos', 'file');
+                        }}
+                        style={{
+                          padding: '10px 14px',
+                          borderRadius: '8px',
+                          border: '1px solid var(--border-neon)',
+                          background: 'rgba(225, 29, 72, 0.08)',
+                          color: 'var(--neon-rose)',
+                          cursor: 'pointer',
+                          fontSize: '12px',
+                          fontFamily: 'var(--font-mono)',
+                          fontWeight: '700'
+                        }}
+                      >
+                        Duyệt...
+                      </button>
+                      <button
+                        onClick={() => {
+                          const updated = config.media.backgroundVideos.filter((_, i) => i !== idx);
+                          setConfig({
+                            ...config,
+                            media: { ...config.media, backgroundVideos: updated }
+                          });
+                        }}
+                        style={{
+                          padding: '10px 12px',
+                          borderRadius: '8px',
+                          border: '1px solid rgba(239, 68, 68, 0.2)',
+                          background: 'rgba(239, 68, 68, 0.08)',
+                          color: '#ef4444',
+                          cursor: 'pointer',
+                          fontSize: '12px',
+                          fontWeight: '700'
+                        }}
+                      >
+                        Xóa
+                      </button>
+                    </div>
+                  ))}
+                  {config.media.backgroundVideos.length === 0 && (
+                    <div style={{ padding: '12px', textAlign: 'center', color: 'var(--text-muted)', fontSize: '12px', border: '1px dashed var(--border-light)', borderRadius: '8px' }}>
+                      Chưa chọn video nền nào. Nền sẽ hiển thị màu đen.
+                    </div>
+                  )}
                 </div>
 
                 <div className="form-group">
@@ -2869,6 +3883,87 @@ export default function Page() {
                   </select>
                 </div>
 
+                <div className="form-group">
+                  <label className="form-label" style={{ color: '#ffffff' }}>Bố cục nhiều video nền (layout)</label>
+                  <select
+                    value={config.background.layout || 'columns'}
+                    onChange={(e) => setConfig({
+                      ...config,
+                      background: { ...config.background, layout: e.target.value as 'columns' | 'grid' | 'rows' }
+                    })}
+                    className="form-select"
+                  >
+                    <option value="columns">Hàng ngang (Columns - Cạnh nhau)</option>
+                    <option value="rows">Hàng dọc (Rows - Xếp tầng)</option>
+                    <option value="grid">Dạng lưới (Grid - Chia ô)</option>
+                  </select>
+                </div>
+
+                <div className="form-group">
+                  <label className="form-label" style={{ color: '#ffffff' }}>Lớp phủ ranh giới ô (seamOverlay)</label>
+                  <select
+                    value={config.background.seamOverlay || 'shadow'}
+                    onChange={(e) => setConfig({
+                      ...config,
+                      background: { ...config.background, seamOverlay: e.target.value as 'none' | 'shadow' | 'glow' | 'neon' | 'feather' }
+                    })}
+                    className="form-select"
+                  >
+                    <option value="none">Không viền (Raw Border)</option>
+                    <option value="shadow">Đổ bóng mờ (Soft Vignette Shadow)</option>
+                    <option value="glow">Phát sáng (Soft Seam Glow)</option>
+                    <option value="neon">Nét Neon phát sáng (Bright Neon Seam)</option>
+                    <option value="feather">Hòa trộn mượt (Split & Feather - CapCut Style)</option>
+                  </select>
+                </div>
+
+                {config.background.seamOverlay === 'feather' && (
+                  <div className="slider-container">
+                    <div className="slider-header">
+                      <span style={{ color: '#ffffff' }}>Độ rộng hòa trộn (featherWidth)</span>
+                      <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>{config.background.featherWidth ?? 80}px</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={200}
+                      value={config.background.featherWidth ?? 80}
+                      onChange={(e) => setConfig({
+                        ...config,
+                        background: { ...config.background, featherWidth: Number(e.target.value) }
+                      })}
+                      className="slider-input"
+                    />
+                  </div>
+                )}
+
+                {(config.background.seamOverlay === 'glow' || config.background.seamOverlay === 'neon') && (
+                  <div className="form-group">
+                    <label className="form-label" style={{ color: '#ffffff' }}>Màu sắc phát sáng ranh giới</label>
+                    <div className="color-picker-wrapper">
+                      <input
+                        type="color"
+                        value={config.background.seamGlowColor || '#8b5cf6'}
+                        onChange={(e) => setConfig({
+                          ...config,
+                          background: { ...config.background, seamGlowColor: e.target.value }
+                        })}
+                        className="color-input-dot"
+                      />
+                      <input
+                        type="text"
+                        value={config.background.seamGlowColor || '#8b5cf6'}
+                        onChange={(e) => setConfig({
+                          ...config,
+                          background: { ...config.background, seamGlowColor: e.target.value }
+                        })}
+                        className="form-input"
+                        style={{ width: '120px', fontFamily: 'var(--font-mono)' }}
+                      />
+                    </div>
+                  </div>
+                )}
+
                 <div className="slider-container">
                   <div className="slider-header">
                     <span style={{ color: '#ffffff' }}>Thời lượng chuyển cảnh xfade</span>
@@ -3103,6 +4198,24 @@ export default function Page() {
                           />
                         </div>
 
+                        <div className="slider-container">
+                          <div className="slider-header">
+                            <span style={{ color: '#ffffff' }}>Độ bo góc viền mặt nạ (Round corners)</span>
+                            <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>{config.imageOverlay.roundCorners ?? 0}px</span>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={200}
+                            value={config.imageOverlay.roundCorners ?? 0}
+                            onChange={(e) => setConfig({
+                              ...config,
+                              imageOverlay: { ...config.imageOverlay, roundCorners: Number(e.target.value) }
+                            })}
+                            className="slider-input"
+                          />
+                        </div>
+
                         <label className="checkbox-container" style={{ marginTop: '12px', marginBottom: '8px' }}>
                           <input
                             type="checkbox"
@@ -3115,6 +4228,78 @@ export default function Page() {
                           />
                           <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#ffffff' }}>Khóa tỷ lệ khung hình khi kéo (Lock Aspect Ratio)</span>
                         </label>
+
+                        <label className="checkbox-container" style={{ marginTop: '12px', marginBottom: '8px' }}>
+                          <input
+                            type="checkbox"
+                            checked={config.imageOverlay.chromaKeyEnabled || false}
+                            onChange={(e) => setConfig({
+                              ...config,
+                              imageOverlay: { ...config.imageOverlay, chromaKeyEnabled: e.target.checked }
+                            })}
+                            className="checkbox-input"
+                          />
+                          <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#ffffff' }}>Tự động loại bỏ phông xanh (Chroma Key Greenscreen)</span>
+                        </label>
+
+                        <label className="checkbox-container" style={{ marginTop: '12px', marginBottom: '8px' }}>
+                          <input
+                            type="checkbox"
+                            checked={config.imageOverlay.borderEnabled || false}
+                            onChange={(e) => setConfig({
+                              ...config,
+                              imageOverlay: { ...config.imageOverlay, borderEnabled: e.target.checked }
+                            })}
+                            className="checkbox-input"
+                          />
+                          <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#ffffff' }}>Bật viền ảnh (Border Outline)</span>
+                        </label>
+
+                        {config.imageOverlay.borderEnabled && (
+                          <div style={{ display: 'flex', gap: '16px', marginTop: '4px', marginBottom: '8px' }}>
+                            <div className="slider-container" style={{ flex: 1, marginBottom: 0 }}>
+                              <div className="slider-header">
+                                <span style={{ color: '#ffffff' }}>Độ rộng viền (borderWidth)</span>
+                                <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>{config.imageOverlay.borderWidth ?? 8}px</span>
+                              </div>
+                              <input
+                                type="range"
+                                min={1}
+                                max={40}
+                                value={config.imageOverlay.borderWidth ?? 8}
+                                onChange={(e) => setConfig({
+                                  ...config,
+                                  imageOverlay: { ...config.imageOverlay, borderWidth: Number(e.target.value) }
+                                })}
+                                className="slider-input"
+                              />
+                            </div>
+                            <div className="form-group" style={{ width: '130px', marginBottom: 0 }}>
+                              <label className="form-label" style={{ color: '#ffffff' }}>Màu viền</label>
+                              <div className="color-picker-wrapper">
+                                <input
+                                  type="color"
+                                  value={config.imageOverlay.borderColor || '#ffffff'}
+                                  onChange={(e) => setConfig({
+                                    ...config,
+                                    imageOverlay: { ...config.imageOverlay, borderColor: e.target.value }
+                                  })}
+                                  className="color-input-dot"
+                                />
+                                <input
+                                  type="text"
+                                  value={config.imageOverlay.borderColor || '#ffffff'}
+                                  onChange={(e) => setConfig({
+                                    ...config,
+                                    imageOverlay: { ...config.imageOverlay, borderColor: e.target.value }
+                                  })}
+                                  className="form-input"
+                                  style={{ width: '100%', padding: '6px', fontSize: '11px', height: '34px' }}
+                                />
+                              </div>
+                            </div>
+                          </div>
+                        )}
 
                         <div className="slider-container">
                           <div className="slider-header">
@@ -3258,19 +4443,32 @@ export default function Page() {
                         <div className="slider-container" style={{ marginTop: '8px' }}>
                           <div className="slider-header">
                             <span style={{ color: 'var(--text-pure)' }}>Chu kỳ đổi ảnh phủ (giây)</span>
-                            <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>{config.imageOverlay.imageDuration || 5}s</span>
+                            <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>
+                              {config.imageOverlay.autoFitDuration && voiceDuration > 0 && config.media.overlayImages.length > 0
+                                ? (voiceDuration / config.media.overlayImages.length).toFixed(2)
+                                : config.imageOverlay.imageDuration || 5}s
+                            </span>
                           </div>
                           <input
                             type="range"
                             min={1}
                             max={300}
                             step={1}
-                            value={config.imageOverlay.imageDuration || 5}
+                            disabled={config.imageOverlay.autoFitDuration || false}
+                            value={
+                              config.imageOverlay.autoFitDuration && voiceDuration > 0 && config.media.overlayImages.length > 0
+                                ? Math.round(voiceDuration / config.media.overlayImages.length)
+                                : config.imageOverlay.imageDuration || 5
+                            }
                             onChange={(e) => setConfig({
                               ...config,
                               imageOverlay: { ...config.imageOverlay, imageDuration: Number(e.target.value) }
                             })}
                             className="slider-input"
+                            style={{
+                              opacity: config.imageOverlay.autoFitDuration ? 0.5 : 1,
+                              cursor: config.imageOverlay.autoFitDuration ? 'not-allowed' : 'pointer'
+                            }}
                           />
                           <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '4px 0 0 0', lineHeight: '1.4' }}>
                             💡 Nếu tài nguyên có nhiều tệp Ảnh phủ, hệ thống sẽ tự động xoay vòng ảnh sau mỗi chu kỳ giây thiết lập tại đây.
@@ -3279,6 +4477,23 @@ export default function Page() {
 
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '12px' }}>
                           <label className="checkbox-container">
+                            <input
+                              type="checkbox"
+                              checked={config.imageOverlay.autoFitDuration || false}
+                              onChange={(e) => setConfig({
+                                ...config,
+                                imageOverlay: { ...config.imageOverlay, autoFitDuration: e.target.checked }
+                              })}
+                              className="checkbox-input"
+                            />
+                            <span style={{ fontWeight: 'bold', color: 'var(--neon-purple)' }}>⏱️ Tự động chia đều thời lượng theo giọng nói (Auto-fit to Voice)</span>
+                          </label>
+                          <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: 0, paddingLeft: '28px', lineHeight: '1.4' }}>
+                            💡 Tính chu kỳ đổi ảnh dựa trên tổng thời lượng Voice chia cho số lượng ảnh.
+                            {voiceDuration > 0 && ` Hiện tại: ${voiceDuration.toFixed(1)} giây / ${config.media.overlayImages.length} ảnh = ${(voiceDuration / Math.max(1, config.media.overlayImages.length)).toFixed(2)} giây/ảnh.`}
+                          </p>
+
+                          <label className="checkbox-container" style={{ marginTop: '4px' }}>
                             <input
                               type="checkbox"
                               checked={config.imageOverlay.randomImageOrder || false}
@@ -3546,6 +4761,21 @@ export default function Page() {
                                 />
                               </div>
 
+                              <div className="slider-container">
+                                <div className="slider-header">
+                                  <span style={{ color: '#ffffff' }}>Độ bo góc viền mặt nạ (Round corners)</span>
+                                  <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>{selectedItem.roundCorners ?? 0}px</span>
+                                </div>
+                                <input
+                                  type="range"
+                                  min={0}
+                                  max={200}
+                                  value={selectedItem.roundCorners ?? 0}
+                                  onChange={(e) => updateSelectedItem({ roundCorners: Number(e.target.value) })}
+                                  className="slider-input"
+                                />
+                              </div>
+
                               <label className="checkbox-container" style={{ marginTop: '4px', marginBottom: '4px' }}>
                                 <input
                                   type="checkbox"
@@ -3555,6 +4785,63 @@ export default function Page() {
                                 />
                                 <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#ffffff' }}>Khóa tỷ lệ khung hình khi kéo (Lock Aspect Ratio)</span>
                               </label>
+
+                              <label className="checkbox-container" style={{ marginTop: '12px', marginBottom: '8px' }}>
+                                <input
+                                  type="checkbox"
+                                  checked={selectedItem.chromaKeyEnabled || false}
+                                  onChange={(e) => updateSelectedItem({ chromaKeyEnabled: e.target.checked })}
+                                  className="checkbox-input"
+                                />
+                                <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#ffffff' }}>Tự động loại bỏ phông xanh (Chroma Key Greenscreen)</span>
+                              </label>
+
+                              <label className="checkbox-container" style={{ marginTop: '12px', marginBottom: '8px' }}>
+                                <input
+                                  type="checkbox"
+                                  checked={selectedItem.borderEnabled || false}
+                                  onChange={(e) => updateSelectedItem({ borderEnabled: e.target.checked })}
+                                  className="checkbox-input"
+                                />
+                                <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#ffffff' }}>Bật viền ảnh (Border Outline)</span>
+                              </label>
+
+                              {selectedItem.borderEnabled && (
+                                <div style={{ display: 'flex', gap: '16px', marginTop: '4px', marginBottom: '8px' }}>
+                                  <div className="slider-container" style={{ flex: 1, marginBottom: 0 }}>
+                                    <div className="slider-header">
+                                      <span style={{ color: '#ffffff' }}>Độ rộng viền (borderWidth)</span>
+                                      <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>{selectedItem.borderWidth ?? 8}px</span>
+                                    </div>
+                                    <input
+                                      type="range"
+                                      min={1}
+                                      max={40}
+                                      value={selectedItem.borderWidth ?? 8}
+                                      onChange={(e) => updateSelectedItem({ borderWidth: Number(e.target.value) })}
+                                      className="slider-input"
+                                    />
+                                  </div>
+                                  <div className="form-group" style={{ width: '130px', marginBottom: 0 }}>
+                                    <label className="form-label" style={{ color: '#ffffff' }}>Màu viền</label>
+                                    <div className="color-picker-wrapper">
+                                      <input
+                                        type="color"
+                                        value={selectedItem.borderColor || '#ffffff'}
+                                        onChange={(e) => updateSelectedItem({ borderColor: e.target.value })}
+                                        className="color-input-dot"
+                                      />
+                                      <input
+                                        type="text"
+                                        value={selectedItem.borderColor || '#ffffff'}
+                                        onChange={(e) => updateSelectedItem({ borderColor: e.target.value })}
+                                        className="form-input"
+                                        style={{ width: '100%', padding: '6px', fontSize: '11px', height: '34px' }}
+                                      />
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
 
                               <div className="slider-container">
                                 <div className="slider-header">
@@ -3684,6 +4971,474 @@ export default function Page() {
                       </>
                     )}
                   </>
+                )}
+
+                <div style={{ margin: '24px 0', borderTop: '1px solid rgba(255,255,255,0.08)' }}></div>
+
+                <label className="checkbox-container" style={{ marginBottom: '16px' }}>
+                  <input
+                    type="checkbox"
+                    checked={config.videoOverlay?.enabled || false}
+                    onChange={(e) => setConfig({
+                      ...config,
+                      videoOverlay: {
+                        ...config.videoOverlay,
+                        enabled: e.target.checked
+                      }
+                    })}
+                    className="checkbox-input"
+                  />
+                  <span style={{ fontWeight: 'bold', color: '#ffffff' }}>Kích hoạt lớp video phủ (Video Overlay)</span>
+                </label>
+
+                {config.videoOverlay?.enabled && (
+                  <div style={{
+                    padding: '16px',
+                    borderRadius: '8px',
+                    backgroundColor: 'rgba(255, 255, 255, 0.02)',
+                    border: '1px solid rgba(255, 255, 255, 0.05)',
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: '16px'
+                  }}>
+                    {/* Danh sách video overlay items */}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span style={{ fontSize: '11px', fontWeight: 'bold', color: '#ffffff', fontFamily: 'var(--font-mono)' }}>
+                          DANH SÁCH LỚP VIDEO PHỦ ĐỒNG THỜI
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => openPathBrowser('addVideoOverlayPath', 'file')}
+                          style={{
+                            padding: '6px 12px',
+                            borderRadius: '6px',
+                            border: '1px solid var(--border-neon)',
+                            background: 'rgba(139, 92, 246, 0.08)',
+                            color: 'var(--neon-purple)',
+                            cursor: 'pointer',
+                            fontSize: '11px',
+                            fontFamily: 'var(--font-mono)',
+                            fontWeight: '700',
+                            transition: 'all 200ms ease'
+                          }}
+                        >
+                          + Thêm video phủ...
+                        </button>
+                      </div>
+
+                      <div style={{
+                        display: 'flex',
+                        flexDirection: 'column',
+                        gap: '6px',
+                        maxHeight: '180px',
+                        overflowY: 'auto',
+                        backgroundColor: 'rgba(255, 255, 255, 0.02)',
+                        padding: '10px',
+                        borderRadius: '8px',
+                        border: '1px solid rgba(255, 255, 255, 0.05)'
+                      }}>
+                        {(!config.videoOverlay?.items || config.videoOverlay.items.length === 0) ? (
+                          <div style={{ color: 'var(--text-muted)', fontSize: '12px', textAlign: 'center', padding: '12px' }}>
+                            Chưa có video phủ nào. Bấm "+ Thêm video phủ..." để bắt đầu!
+                          </div>
+                        ) : (
+                          config.videoOverlay.items.map((item) => (
+                            <div
+                              key={item.id}
+                              onClick={() => setSelectedVideoOverlayItemId(item.id)}
+                              style={{
+                                display: 'flex',
+                                justifyContent: 'space-between',
+                                alignItems: 'center',
+                                gap: '10px',
+                                padding: '8px 10px',
+                                borderRadius: '6px',
+                                backgroundColor: selectedVideoOverlayItemId === item.id ? 'rgba(139, 92, 246, 0.12)' : 'rgba(255, 255, 255, 0.02)',
+                                border: selectedVideoOverlayItemId === item.id ? '1px solid var(--neon-purple)' : '1px solid rgba(255, 255, 255, 0.03)',
+                                cursor: 'pointer',
+                                transition: 'all 150ms ease'
+                              }}
+                            >
+                              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flex: 1, minWidth: 0 }}>
+                                <input
+                                  type="checkbox"
+                                  checked={item.enabled}
+                                  onClick={(e) => e.stopPropagation()}
+                                  onChange={(e) => {
+                                    const updated = (config.videoOverlay?.items || []).map(it => 
+                                      it.id === item.id ? { ...it, enabled: e.target.checked } : it
+                                    );
+                                    setConfig({
+                                      ...config,
+                                      videoOverlay: {
+                                        ...config.videoOverlay,
+                                        enabled: config.videoOverlay?.enabled ?? true,
+                                        items: updated
+                                      }
+                                    });
+                                  }}
+                                  style={{ cursor: 'pointer' }}
+                                />
+                                <span style={{
+                                  fontSize: '12px',
+                                  fontFamily: 'var(--font-mono)',
+                                  color: selectedVideoOverlayItemId === item.id ? '#ffffff' : 'var(--text-pure)',
+                                  fontWeight: selectedVideoOverlayItemId === item.id ? 'bold' : 'normal',
+                                  overflow: 'hidden',
+                                  textOverflow: 'ellipsis',
+                                  whiteSpace: 'nowrap'
+                                }}>
+                                  {item.videoPath.split('\\').pop() || item.videoPath}
+                                </span>
+                              </div>
+                              <div style={{ display: 'flex', gap: '6px' }} onClick={(e) => e.stopPropagation()}>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    const updated = (config.videoOverlay?.items || []).filter(it => it.id !== item.id);
+                                    setConfig({
+                                      ...config,
+                                      videoOverlay: {
+                                        ...config.videoOverlay,
+                                        enabled: config.videoOverlay?.enabled ?? true,
+                                        items: updated
+                                      }
+                                    });
+                                    if (selectedVideoOverlayItemId === item.id) {
+                                      setSelectedVideoOverlayItemId(updated.length > 0 ? updated[0].id : null);
+                                    }
+                                  }}
+                                  style={{
+                                    background: 'rgba(239, 68, 68, 0.15)',
+                                    border: 'none',
+                                    color: '#ef4444',
+                                    borderRadius: '4px',
+                                    padding: '2px 6px',
+                                    cursor: 'pointer',
+                                    fontSize: '11px',
+                                    fontWeight: 'bold'
+                                  }}
+                                >
+                                  Xóa
+                                </button>
+                              </div>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Hiệu chỉnh thuộc tính video overlay được chọn */}
+                    {(() => {
+                      const selectedItem = (config.videoOverlay?.items || []).find(it => it.id === selectedVideoOverlayItemId);
+                      if (!selectedItem) {
+                        return (
+                          <div style={{
+                            padding: '16px',
+                            borderRadius: '8px',
+                            backgroundColor: 'rgba(255, 255, 255, 0.02)',
+                            border: '1px solid rgba(255, 255, 255, 0.05)',
+                            textAlign: 'center',
+                            fontSize: '12px',
+                            color: 'var(--text-muted)'
+                          }}>
+                            💡 Vui lòng bấm vào một video phủ trong danh sách trên để hiệu chỉnh thuộc tính riêng biệt (vị trí, kích thước, phông xanh,...) của lớp video đó.
+                          </div>
+                        );
+                      }
+
+                      const updateSelectedItem = (fields: Partial<typeof selectedItem>) => {
+                        const updated = (config.videoOverlay?.items || []).map(it => 
+                          it.id === selectedItem.id ? { ...it, ...fields } : it
+                        );
+                        setConfig({
+                          ...config,
+                          videoOverlay: {
+                            ...config.videoOverlay,
+                            enabled: config.videoOverlay?.enabled ?? true,
+                            items: updated
+                          }
+                        });
+                      };
+
+                      return (
+                        <div style={{
+                          padding: '16px',
+                          borderRadius: '8px',
+                          backgroundColor: 'rgba(255, 255, 255, 0.02)',
+                          border: '1px solid rgba(255, 255, 255, 0.05)',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: '16px'
+                        }}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', borderBottom: '1px solid rgba(255, 255, 255, 0.08)', paddingBottom: '8px', marginBottom: '4px' }}>
+                            <span style={{ fontSize: '12px', fontWeight: 'bold', color: 'var(--neon-purple)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '240px' }}>
+                              ĐANG SỬA: {selectedItem.videoPath.split('\\').pop()}
+                            </span>
+                            <span style={{ fontSize: '10px', color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+                              ID: {selectedItem.id}
+                            </span>
+                          </div>
+
+                          <div className="form-group">
+                            <label className="form-label" style={{ color: '#ffffff' }}>Tệp tin video phủ (Video Path)</label>
+                            <div style={{ display: 'flex', gap: '8px' }}>
+                              <input
+                                type="text"
+                                value={selectedItem.videoPath}
+                                onChange={(e) => updateSelectedItem({ videoPath: e.target.value })}
+                                className="form-input"
+                                style={{ flex: 1 }}
+                              />
+                              <button
+                                type="button"
+                                onClick={() => openPathBrowser('videoOverlayPath', 'file')}
+                                style={{
+                                  padding: '0 12px',
+                                  height: '38px',
+                                  borderRadius: '6px',
+                                  backgroundColor: 'rgba(139, 92, 246, 0.15)',
+                                  border: '1px solid var(--neon-purple)',
+                                  color: '#ffffff',
+                                  cursor: 'pointer',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  transition: 'all 200ms ease'
+                                }}
+                              >
+                                <FolderOpen size={16} />
+                              </button>
+                            </div>
+                          </div>
+
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                            <label className="checkbox-container">
+                              <input
+                                type="checkbox"
+                                checked={selectedItem.chromaKeyEnabled || false}
+                                onChange={(e) => updateSelectedItem({ chromaKeyEnabled: e.target.checked })}
+                                className="checkbox-input"
+                              />
+                              <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#ffffff' }}>Tự động loại bỏ màu nền (Chroma/Color Key)</span>
+                            </label>
+
+                            <label className="checkbox-container">
+                              <input
+                                type="checkbox"
+                                checked={selectedItem.loop || false}
+                                onChange={(e) => updateSelectedItem({ loop: e.target.checked })}
+                                className="checkbox-input"
+                              />
+                              <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#ffffff' }}>Lặp lại video liên tục (Loop Video)</span>
+                            </label>
+                          </div>
+
+                          {selectedItem.chromaKeyEnabled && (
+                            <div style={{
+                              padding: '12px',
+                              borderRadius: '6px',
+                              backgroundColor: 'rgba(0,0,0,0.2)',
+                              border: '1px solid rgba(255,255,255,0.05)',
+                              display: 'flex',
+                              flexDirection: 'column',
+                              gap: '12px'
+                            }}>
+                              <div className="form-group" style={{ marginBottom: 0 }}>
+                                <label className="form-label" style={{ color: '#ffffff', fontSize: '12px' }}>Màu nền cần tách (Chroma Key Color)</label>
+                                <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                                  <input
+                                    type="color"
+                                    value={selectedItem.chromaKeyColor || '#00ff00'}
+                                    onChange={(e) => updateSelectedItem({ chromaKeyColor: e.target.value })}
+                                    style={{
+                                      border: 'none',
+                                      width: '40px',
+                                      height: '30px',
+                                      borderRadius: '4px',
+                                      cursor: 'pointer',
+                                      backgroundColor: 'transparent'
+                                    }}
+                                  />
+                                  <input
+                                    type="text"
+                                    value={selectedItem.chromaKeyColor || '#00ff00'}
+                                    onChange={(e) => updateSelectedItem({ chromaKeyColor: e.target.value })}
+                                    className="form-input"
+                                    style={{ flex: 1, fontFamily: 'var(--font-mono)', fontSize: '12px' }}
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => updateSelectedItem({ chromaKeyColor: '#00ff00', chromaKeySimilarity: 0.18, chromaKeyBlend: 0.04 })}
+                                    style={{
+                                      padding: '4px 8px',
+                                      fontSize: '11px',
+                                      borderRadius: '4px',
+                                      backgroundColor: 'rgba(0,255,0,0.1)',
+                                      border: '1px solid #00ff00',
+                                      color: '#00ff00',
+                                      cursor: 'pointer'
+                                    }}
+                                  >
+                                    Phông xanh
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => updateSelectedItem({ chromaKeyColor: '#000000', chromaKeySimilarity: 0.12, chromaKeyBlend: 0.05 })}
+                                    style={{
+                                      padding: '4px 8px',
+                                      fontSize: '11px',
+                                      borderRadius: '4px',
+                                      backgroundColor: 'rgba(255,255,255,0.05)',
+                                      border: '1px solid #ffffff',
+                                      color: '#ffffff',
+                                      cursor: 'pointer'
+                                    }}
+                                  >
+                                    Phông đen
+                                  </button>
+                                </div>
+                              </div>
+
+                              <div className="slider-container" style={{ marginBottom: 0 }}>
+                                <div className="slider-header">
+                                  <span style={{ color: '#ffffff', fontSize: '11px' }}>Độ nhạy lọc màu (Similarity)</span>
+                                  <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold', fontSize: '11px' }}>
+                                    {selectedItem.chromaKeySimilarity ?? 0.18}
+                                  </span>
+                                </div>
+                                <input
+                                  type="range"
+                                  min={0.01}
+                                  max={1.0}
+                                  step={0.01}
+                                  value={selectedItem.chromaKeySimilarity ?? 0.18}
+                                  onChange={(e) => updateSelectedItem({ chromaKeySimilarity: Number(e.target.value) })}
+                                  className="slider-input"
+                                />
+                              </div>
+
+                              <div className="slider-container" style={{ marginBottom: 0 }}>
+                                <div className="slider-header">
+                                  <span style={{ color: '#ffffff', fontSize: '11px' }}>Độ mịn viền lọc (Blend)</span>
+                                  <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold', fontSize: '11px' }}>
+                                    {selectedItem.chromaKeyBlend ?? 0.04}
+                                  </span>
+                                </div>
+                                <input
+                                  type="range"
+                                  min={0.0}
+                                  max={1.0}
+                                  step={0.01}
+                                  value={selectedItem.chromaKeyBlend ?? 0.04}
+                                  onChange={(e) => updateSelectedItem({ chromaKeyBlend: Number(e.target.value) })}
+                                  className="slider-input"
+                                />
+                              </div>
+                            </div>
+                          )}
+
+                          <div className="slider-container">
+                            <div className="slider-header">
+                              <span style={{ color: '#ffffff' }}>Chu kỳ lặp lại video (phút)</span>
+                              <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>
+                                {selectedItem.repeatInterval || 0} phút
+                              </span>
+                            </div>
+                            <input
+                              type="range"
+                              min={0}
+                              max={10}
+                              step={0.5}
+                              value={selectedItem.repeatInterval || 0}
+                              onChange={(e) => updateSelectedItem({ repeatInterval: Number(e.target.value) })}
+                              className="slider-input"
+                            />
+                            <p style={{ fontSize: '11px', color: 'var(--text-muted)', margin: '4px 0 0 0', lineHeight: '1.4' }}>
+                              💡 Chọn số phút lặp lại (Ví dụ: 1 phút nghĩa là cứ mỗi 1 phút lớp video này hiển thị chạy 1 lần). Chọn 0 để phát liên tục.
+                            </p>
+                          </div>
+
+                          <div className="slider-container">
+                            <div className="slider-header">
+                              <span style={{ color: '#ffffff' }}>Chiều rộng video (width)</span>
+                              <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>{selectedItem.width}px</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={100}
+                              max={1920}
+                              value={selectedItem.width}
+                              onChange={(e) => updateSelectedItem({ width: Number(e.target.value) })}
+                              className="slider-input"
+                            />
+                          </div>
+
+                          <div className="slider-container">
+                            <div className="slider-header">
+                              <span style={{ color: '#ffffff' }}>Chiều cao video (height)</span>
+                              <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>{selectedItem.height}px</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={50}
+                              max={1080}
+                              value={selectedItem.height}
+                              onChange={(e) => updateSelectedItem({ height: Number(e.target.value) })}
+                              className="slider-input"
+                            />
+                          </div>
+
+                          <div className="slider-container">
+                            <div className="slider-header">
+                              <span style={{ color: '#ffffff' }}>Vị trí video theo chiều ngang (X)</span>
+                              <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>{selectedItem.x}px</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={0}
+                              max={1920}
+                              value={selectedItem.x}
+                              onChange={(e) => updateSelectedItem({ x: Number(e.target.value) })}
+                              className="slider-input"
+                            />
+                          </div>
+
+                          <div className="slider-container">
+                            <div className="slider-header">
+                              <span style={{ color: '#ffffff' }}>Vị trí video theo chiều dọc (Y)</span>
+                              <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>{selectedItem.y}px</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={0}
+                              max={1080}
+                              value={selectedItem.y}
+                              onChange={(e) => updateSelectedItem({ y: Number(e.target.value) })}
+                              className="slider-input"
+                            />
+                          </div>
+
+                          <div className="slider-container">
+                            <div className="slider-header">
+                              <span style={{ color: 'var(--text-pure)' }}>Độ trong suốt video</span>
+                              <span style={{ color: 'var(--neon-purple)', fontWeight: 'bold' }}>{Math.round((selectedItem.opacity ?? 1.0) * 100)}%</span>
+                            </div>
+                            <input
+                              type="range"
+                              min={0.1}
+                              max={1.0}
+                              step={0.05}
+                              value={selectedItem.opacity ?? 1.0}
+                              onChange={(e) => updateSelectedItem({ opacity: Number(e.target.value) })}
+                              className="slider-input"
+                            />
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
                 )}
               </>
             )}
@@ -4893,6 +6648,78 @@ export default function Page() {
                 Lưu lại
               </button>
             </div>
+
+            <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+              <button
+                onClick={() => document.getElementById('import-preset-file-input')?.click()}
+                style={{
+                  flex: 1,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '6px',
+                  border: '1px solid rgba(99, 102, 241, 0.3)',
+                  borderRadius: '4px',
+                  background: 'rgba(99, 102, 241, 0.08)',
+                  color: '#818cf8',
+                  padding: '8px 12px',
+                  fontSize: '13px',
+                  fontWeight: '600',
+                  cursor: 'pointer',
+                  transition: 'all 200ms ease'
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = '#6366f1';
+                  e.currentTarget.style.color = '#ffffff';
+                  e.currentTarget.style.borderColor = 'transparent';
+                  e.currentTarget.style.boxShadow = '0 0 10px rgba(99, 102, 241, 0.4)';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = 'rgba(99, 102, 241, 0.08)';
+                  e.currentTarget.style.borderColor = 'rgba(99, 102, 241, 0.3)';
+                  e.currentTarget.style.color = '#818cf8';
+                  e.currentTarget.style.boxShadow = 'none';
+                }}
+              >
+                <Upload size={14} />
+                Nhập từ File
+              </button>
+
+              <button
+                onClick={handleExportPreset}
+                style={{
+                  flex: 1,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '6px',
+                  border: '1px solid rgba(139, 92, 246, 0.3)',
+                  borderRadius: '4px',
+                  background: 'rgba(139, 92, 246, 0.08)',
+                  color: '#a78bfa',
+                  padding: '8px 12px',
+                  fontSize: '13px',
+                  fontWeight: '600',
+                  cursor: 'pointer',
+                  transition: 'all 200ms ease'
+                }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.background = 'var(--neon-purple)';
+                  e.currentTarget.style.color = '#ffffff';
+                  e.currentTarget.style.borderColor = 'transparent';
+                  e.currentTarget.style.boxShadow = '0 0 10px rgba(139, 92, 246, 0.4)';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.background = 'rgba(139, 92, 246, 0.08)';
+                  e.currentTarget.style.borderColor = 'rgba(139, 92, 246, 0.3)';
+                  e.currentTarget.style.color = '#a78bfa';
+                  e.currentTarget.style.boxShadow = 'none';
+                }}
+              >
+                <Download size={14} />
+                Xuất ra File
+              </button>
+            </div>
           </div>
 
         </section>
@@ -5280,6 +7107,60 @@ export default function Page() {
                   >
                     HỦY BỎ
                   </button>
+                  {browserMode === 'file' && (browserField === 'overlayImages' || browserField === 'backgroundVideos') && (
+                    <button
+                      onClick={() => {
+                        const isImg = browserField === 'overlayImages';
+                        const allowedExts = isImg 
+                          ? ['png', 'jpg', 'jpeg', 'webp', 'gif'] 
+                          : ['mp4', 'mkv', 'avi'];
+                        const filesToSelect = dirItems.filter(item => 
+                          item.type === 'file' && 
+                          item.ext && 
+                          allowedExts.includes(item.ext.toLowerCase())
+                        );
+                        
+                        if (filesToSelect.length === 0) {
+                          alert(`Thư mục này không chứa tệp tin ${isImg ? 'ảnh' : 'video'} nào phù hợp.`);
+                          return;
+                        }
+                        
+                        const slash = currentDirPath.endsWith('\\') || currentDirPath === '' ? '' : '\\';
+                        const paths = filesToSelect.map(item => 
+                          currentDirPath === '' ? item.name : `${currentDirPath}${slash}${item.name}`
+                        );
+                        
+                        applySelectedPathsBulk(paths);
+                      }}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        padding: '10px 20px',
+                        borderRadius: '8px',
+                        backgroundColor: 'var(--neon-purple)',
+                        color: '#ffffff',
+                        border: 'none',
+                        cursor: 'pointer',
+                        fontSize: '13px',
+                        fontFamily: 'var(--font-mono)',
+                        fontWeight: '700',
+                        boxShadow: '0 4px 14px rgba(139, 92, 246, 0.35)',
+                        transition: 'all 200ms ease'
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.filter = 'brightness(1.15)';
+                        e.currentTarget.style.boxShadow = '0 0 15px rgba(139, 92, 246, 0.6)';
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.filter = 'brightness(1)';
+                        e.currentTarget.style.boxShadow = '0 4px 14px rgba(139, 92, 246, 0.35)';
+                      }}
+                    >
+                      <Check size={14} />
+                      CHỌN TẤT CẢ ({dirItems.filter(item => item.type === 'file' && item.ext && (browserField === 'overlayImages' ? ['png', 'jpg', 'jpeg', 'webp', 'gif'] : ['mp4', 'mkv', 'avi']).includes(item.ext.toLowerCase())).length} tệp)
+                    </button>
+                  )}
                   {browserMode === 'dir' && (
                     <>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginRight: '8px' }}>
@@ -5676,6 +7557,14 @@ export default function Page() {
         </div>
       )}
       
+      <input 
+        type="file" 
+        id="import-preset-file-input" 
+        accept=".json" 
+        onChange={handleImportPreset} 
+        style={{ display: 'none' }} 
+      />
+
       {/* ❓ Hướng dẫn sử dụng popup modal */}
       {isGuideOpen && (
         <div 

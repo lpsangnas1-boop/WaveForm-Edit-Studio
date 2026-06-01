@@ -13,6 +13,10 @@ export interface BackgroundConfig {
   transitionDuration: number; // in seconds, default 1.0
   randomVideoOrder: boolean;
   fillTimeline: boolean;
+  layout?: 'columns' | 'grid' | 'rows';
+  seamOverlay?: 'none' | 'shadow' | 'glow' | 'neon' | 'feather';
+  seamGlowColor?: string;
+  featherWidth?: number;
 }
 
 export interface ImageOverlayItem {
@@ -29,7 +33,12 @@ export interface ImageOverlayItem {
   maskShape: 'rectangle' | 'rect_3_4' | 'rect_4_3' | 'square' | 'circle' | 'hexagon';
   inset: number;
   feather: number;
+  roundCorners?: number;
   bounceEnabled?: boolean;
+  borderEnabled?: boolean;
+  borderWidth?: number;
+  borderColor?: string;
+  chromaKeyEnabled?: boolean;
 }
 
 export interface ImageOverlayConfig {
@@ -44,13 +53,42 @@ export interface ImageOverlayConfig {
   maskShape: 'rectangle' | 'rect_3_4' | 'rect_4_3' | 'square' | 'circle' | 'hexagon';
   inset: number;
   feather: number;
+  roundCorners?: number;
   imageDuration: number; // seconds
   imageTransitionDuration: number; // seconds
+  autoFitDuration?: boolean;
   randomImageOrder: boolean;
   bounceEnabled?: boolean;
   items?: ImageOverlayItem[];
   overlayMode?: 'cycle' | 'custom';
+  borderEnabled?: boolean;
+  borderWidth?: number;
+  borderColor?: string;
+  chromaKeyEnabled?: boolean;
 }
+
+export interface VideoOverlayItem {
+  id: string;
+  videoPath: string;
+  enabled: boolean;
+  x: number; // center X
+  y: number; // center Y
+  width: number;
+  height: number;
+  opacity: number; // 0.0 - 1.0
+  chromaKeyEnabled: boolean;
+  chromaKeyColor: string; // Hex format, e.g. '#00ff00' or '#000000'
+  chromaKeySimilarity: number;
+  chromaKeyBlend: number;
+  loop: boolean;
+  repeatInterval: number; // in minutes, 0 means loop/play once
+}
+
+export interface VideoOverlayConfig {
+  enabled: boolean;
+  items?: VideoOverlayItem[];
+}
+
 
 export interface WaveformConfig {
   enabled: boolean;
@@ -121,6 +159,7 @@ export interface RenderConfig {
   media: MediaConfig;
   background: BackgroundConfig;
   imageOverlay: ImageOverlayConfig;
+  videoOverlay?: VideoOverlayConfig;
   waveform: WaveformConfig;
   subtitles: SubtitlesConfig;
   camera: CameraConfig;

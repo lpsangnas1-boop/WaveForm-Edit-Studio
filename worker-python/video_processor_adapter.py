@@ -497,7 +497,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return ass_path
 
 # Process image overlay and return paths
+# Process image overlay and return paths
 def process_image_overlay(image_path: str, cfg, temp_dir: str) -> str:
+    image_path = image_path.strip('\"\' ')
     img = Image.open(image_path).convert("RGBA")
     w, h = cfg.width, cfg.height
     
@@ -505,21 +507,58 @@ def process_image_overlay(image_path: str, cfg, temp_dir: str) -> str:
     from PIL import ImageOps
     img = ImageOps.fit(img, (w, h), Image.Resampling.LANCZOS)
     
+    # Tự động loại bỏ phông xanh (greenscreen removal) sử dụng numpy
+    if getattr(cfg, 'chromaKeyEnabled', False):
+        import numpy as np
+        data = np.array(img)
+        r, g, b, a = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
+        green_diff = g.astype(np.int16) - np.maximum(r, b).astype(np.int16)
+        
+        # Ngưỡng phát hiện màu xanh
+        low_thresh = 15
+        high_thresh = low_thresh + 25
+        
+        mask_gs = np.ones_like(green_diff) * 255
+        transition = (green_diff > low_thresh) & (green_diff < high_thresh)
+        mask_gs[transition] = 255 - (255 * (green_diff[transition] - low_thresh) / (high_thresh - low_thresh)).astype(np.uint8)
+        mask_gs[green_diff >= high_thresh] = 0
+        
+        # Khử răng cưa màu xanh ở mép (Spill reduction)
+        rb_avg = ((r.astype(np.uint16) + b.astype(np.uint16)) // 2).astype(np.uint8)
+        data[:,:,1] = np.where((green_diff > 0) & (g > rb_avg), rb_avg, g)
+        data[:,:,3] = np.minimum(a, mask_gs).astype(np.uint8)
+        
+        img = Image.fromarray(data, "RGBA")
+        
     # Create mask of same size
     mask = Image.new("L", (w, h), 0)
     draw = ImageDraw.Draw(mask)
     shape = cfg.maskShape
     inset = cfg.inset if hasattr(cfg, 'inset') else 10
+    feather = cfg.feather if hasattr(cfg, 'feather') else 8
+    
+    effective_inset = inset
+    if feather > 0:
+        effective_inset = inset + int(feather * 2.5)
+        
+    max_inset = max(0, min(w, h) // 2 - 2)
+    if effective_inset > max_inset:
+        effective_inset = max_inset
+    
+    points = []
+    lx = 0
+    ty = 0
+    side = 0
+    cx = w // 2
+    cy = h // 2
+    r = 0
     
     if shape == "circle":
         d = min(w, h)
-        cx, cy = w // 2, h // 2
         r = d // 2
-        draw.ellipse([cx - r + inset, cy - r + inset, cx + r - inset, cy + r - inset], fill=255)
+        draw.ellipse([cx - r + effective_inset, cy - r + effective_inset, cx + r - effective_inset, cy + r - effective_inset], fill=255)
     elif shape == "hexagon":
-        cx, cy = w // 2, h // 2
-        r = (min(w, h) - inset * 2) // 2
-        points = []
+        r = (min(w, h) - effective_inset * 2) // 2
         for i in range(6):
             angle = i * math.pi / 3
             px = cx + r * math.cos(angle)
@@ -527,15 +566,21 @@ def process_image_overlay(image_path: str, cfg, temp_dir: str) -> str:
             points.append((px, py))
         draw.polygon(points, fill=255)
     elif shape == "square":
-        side = min(w, h) - inset * 2
-        cx, cy = w // 2, h // 2
+        side = min(w, h) - effective_inset * 2
         lx = cx - side // 2
         ty = cy - side // 2
-        draw.rectangle([lx, ty, lx + side, ty + side], fill=255)
+        round_corners = getattr(cfg, 'roundCorners', 0)
+        if round_corners and round_corners > 0:
+            draw.rounded_rectangle([lx, ty, lx + side, ty + side], radius=round_corners, fill=255)
+        else:
+            draw.rectangle([lx, ty, lx + side, ty + side], fill=255)
     else: # rectangle
-        draw.rectangle([inset, inset, w - inset, h - inset], fill=255)
+        round_corners = getattr(cfg, 'roundCorners', 0)
+        if round_corners and round_corners > 0:
+            draw.rounded_rectangle([effective_inset, effective_inset, w - effective_inset, h - effective_inset], radius=round_corners, fill=255)
+        else:
+            draw.rectangle([effective_inset, effective_inset, w - effective_inset, h - effective_inset], fill=255)
         
-    feather = cfg.feather if hasattr(cfg, 'feather') else 8
     if feather > 0:
         mask = mask.filter(ImageFilter.GaussianBlur(feather))
         
@@ -544,16 +589,232 @@ def process_image_overlay(image_path: str, cfg, temp_dir: str) -> str:
     scaled_mask = mask.point(lambda p: int(p * opacity_val / 255))
     
     # Alpha Compositing: Tạo nền trong suốt sạch hoàn toàn và composite ảnh đè lên bằng mặt nạ
-    # Điều này triệt tiêu hoàn toàn các hộp/viền chữ nhật bao quanh khi hiển thị trong FFmpeg
     transparent_bg = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     img = Image.composite(img, transparent_bg, scaled_mask)
     
+    # Vẽ viền phát sáng (border) xung quanh hình mặt nạ nếu được bật
+    if getattr(cfg, 'borderEnabled', False):
+        border_width = getattr(cfg, 'borderWidth', 8) or 8
+        border_color_hex = getattr(cfg, 'borderColor', '#ffffff') or '#ffffff'
+        
+        def parse_color_hex(h_str, alpha=255):
+            h_str = h_str.strip('#')
+            if len(h_str) == 6:
+                return (int(h_str[0:2], 16), int(h_str[2:4], 16), int(h_str[4:6], 16), alpha)
+            return (255, 255, 255, alpha)
+            
+        border_color = parse_color_hex(border_color_hex, int(cfg.opacity * 255))
+        border_draw = ImageDraw.Draw(img)
+        
+        round_corners = getattr(cfg, 'roundCorners', 0)
+        if shape == "circle":
+            border_draw.ellipse([cx - r + effective_inset, cy - r + effective_inset, cx + r - effective_inset, cy + r - effective_inset], outline=border_color, width=border_width)
+        elif shape == "hexagon" and points:
+            border_draw.polygon(points, outline=border_color, width=border_width)
+        elif shape == "square":
+            if round_corners and round_corners > 0:
+                border_draw.rounded_rectangle([lx, ty, lx + side, ty + side], radius=round_corners, outline=border_color, width=border_width)
+            else:
+                border_draw.rectangle([lx, ty, lx + side, ty + side], outline=border_color, width=border_width)
+        else:
+            if round_corners and round_corners > 0:
+                border_draw.rounded_rectangle([effective_inset, effective_inset, w - effective_inset, h - effective_inset], radius=round_corners, outline=border_color, width=border_width)
+            else:
+                border_draw.rectangle([effective_inset, effective_inset, w - effective_inset, h - effective_inset], outline=border_color, width=border_width)
+            
     # Use item ID in filename if available, to prevent overwrite collisions
     filename_id = getattr(cfg, 'id', 'default')
+    # Hash the absolute image path to prevent collision when filenames are identical
+    import hashlib
+    path_hash = hashlib.md5(image_path.encode('utf-8')).hexdigest()[:8]
     base_name = os.path.splitext(os.path.basename(image_path))[0]
-    processed_path = os.path.join(temp_dir, f"processed_overlay_{filename_id}_{base_name}.png")
+    processed_path = os.path.join(temp_dir, f"processed_overlay_{filename_id}_{base_name}_{path_hash}.png")
     img.save(processed_path, format="PNG")
     return processed_path
+
+# Generate a transparent PNG containing the seams (shadow/glow dividers) between split screen background videos
+def generate_seam_overlay(width: int, height: int, num_videos: int, layout: str, style: str, glow_color: str, temp_dir: str) -> str:
+    # Create transparent base image
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    
+    if num_videos <= 1 or style == "none":
+        path = os.path.join(temp_dir, "seam_overlay.png")
+        img.save(path, "PNG")
+        return path
+        
+    seams = [] # List of tuples: (x1, y1, x2, y2, orientation)
+    
+    if layout == "columns":
+        col_w = width // num_videos
+        for i in range(1, num_videos):
+            x = i * col_w
+            seams.append((x, 0, x, height, "vertical"))
+    elif layout == "rows":
+        row_h = height // num_videos
+        for i in range(1, num_videos):
+            y = i * row_h
+            seams.append((0, y, width, y, "horizontal"))
+    elif layout == "grid":
+        if num_videos == 4:
+            seams.append((width // 2, 0, width // 2, height, "vertical"))
+            seams.append((0, height // 2, width, height // 2, "horizontal"))
+        elif num_videos == 3:
+            seams.append((0, height // 2, width, height // 2, "horizontal"))
+            seams.append((width // 2, 0, width // 2, height // 2, "vertical"))
+        else: # 2 videos
+            seams.append((width // 2, 0, width // 2, height, "vertical"))
+            
+    # Helper to parse hex color
+    def parse_hex(hex_str):
+        hex_str = hex_str.strip('#')
+        if len(hex_str) == 6:
+            return (int(hex_str[0:2], 16), int(hex_str[2:4], 16), int(hex_str[4:6], 16))
+        return (139, 92, 246) # purple/indigo
+        
+    color_rgb = parse_hex(glow_color)
+    
+    # 1. Draw solid lines at the exact center of seams to 100% cover the video cuts
+    solid_img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    solid_draw = ImageDraw.Draw(solid_img)
+    for x1, y1, x2, y2, orientation in seams:
+        if style == "shadow":
+            solid_draw.line([x1, y1, x2, y2], fill=(0, 0, 0, 255), width=4)
+        elif style == "glow":
+            solid_draw.line([x1, y1, x2, y2], fill=color_rgb + (255,), width=4)
+        elif style == "neon":
+            solid_draw.line([x1, y1, x2, y2], fill=(255, 255, 255, 255), width=4)
+            
+    # 2. Draw wider lines on a mask image, and apply Gaussian blur to create the soft falloff
+    mask = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    mask_draw = ImageDraw.Draw(mask)
+    for x1, y1, x2, y2, orientation in seams:
+        if style == "shadow":
+            mask_draw.line([x1, y1, x2, y2], fill=(0, 0, 0, 230), width=80)
+        elif style == "glow" or style == "neon":
+            mask_draw.line([x1, y1, x2, y2], fill=color_rgb + (200,), width=80)
+            
+    blurred_mask = mask.filter(ImageFilter.GaussianBlur(radius=25))
+    
+    # 3. Composite everything together
+    # Overlay the solid lines first, then the soft blur on top to blend the solid line's sharp edges
+    img = Image.alpha_composite(img, solid_img)
+    img = Image.alpha_composite(img, blurred_mask)
+    
+    # 4. For neon, draw a thin bright core line on top of the blur
+    if style == "neon":
+        neon_draw = ImageDraw.Draw(img)
+        for x1, y1, x2, y2, orientation in seams:
+            neon_draw.line([x1, y1, x2, y2], fill=(255, 255, 255, 255), width=2)
+            
+    path = os.path.join(temp_dir, "seam_overlay.png")
+    img.save(path, "PNG")
+    return path
+
+# Calculate coordinates, sizes, and edge fade widths for background video slots under feather blend
+def calculate_feather_slot(i: int, num_bg: int, res_w: int, res_h: int, bg_layout: str, f_width: int):
+    fade_left = 0
+    fade_top = 0
+    
+    if bg_layout == "columns":
+        h_slot = res_h
+        y_pos = 0
+        col_w = res_w // num_bg
+        left_seam = i * col_w if i > 0 else 0
+        right_seam = (i + 1) * col_w if i < num_bg - 1 else res_w
+        x_pos = left_seam - f_width // 2 if i > 0 else 0
+        x_end = right_seam + f_width if i < num_bg - 1 else res_w
+        w_slot = x_end - x_pos
+        if i > 0:
+            fade_left = f_width
+    elif bg_layout == "rows":
+        w_slot = res_w
+        x_pos = 0
+        row_h = res_h // num_bg
+        top_seam = i * row_h if i > 0 else 0
+        bottom_seam = (i + 1) * row_h if i < num_bg - 1 else res_h
+        y_pos = top_seam - f_width // 2 if i > 0 else 0
+        y_end = bottom_seam + f_width if i < num_bg - 1 else res_h
+        h_slot = y_end - y_pos
+        if i > 0:
+            fade_top = f_width
+    else:  # "grid"
+        half_w = res_w // 2
+        half_h = res_h // 2
+        if num_bg == 2:
+            h_slot = res_h
+            y_pos = 0
+            x_pos = half_w - f_width // 2 if i == 1 else 0
+            x_end = res_w if i == 1 else half_w + f_width
+            w_slot = x_end - x_pos
+            if i == 1:
+                fade_left = f_width
+        elif num_bg == 3:
+            if i == 0:
+                x_pos = 0
+                y_pos = 0
+                w_slot = half_w + f_width
+                h_slot = half_h + f_width
+            elif i == 1:
+                x_pos = half_w - f_width // 2
+                y_pos = 0
+                w_slot = res_w - x_pos
+                h_slot = half_h + f_width
+                fade_left = f_width
+            else:
+                x_pos = 0
+                y_pos = half_h - f_width // 2
+                w_slot = res_w
+                h_slot = res_h - y_pos
+                fade_top = f_width
+        else:  # 4 videos grid
+            is_left = (i == 0 or i == 2)
+            is_top = (i == 0 or i == 1)
+            x_pos = 0 if is_left else half_w - f_width // 2
+            y_pos = 0 if is_top else half_h - f_width // 2
+            x_end = half_w + f_width if is_left else res_w
+            y_end = half_h + f_width if is_top else res_h
+            w_slot = x_end - x_pos
+            h_slot = y_end - y_pos
+            if not is_left:
+                fade_left = f_width
+            if not is_top:
+                fade_top = f_width
+                
+    # Force even dimensions for yuv420p video format compatibility to avoid filter size mismatches
+    w_slot = (w_slot // 2) * 2
+    h_slot = (h_slot // 2) * 2
+    return w_slot, h_slot, x_pos, y_pos, fade_left, fade_top
+
+# Generate a grayscale alpha mask for feathering transition
+def generate_alpha_mask(width: int, height: int, fade_left: int, fade_top: int, temp_dir: str, idx: int) -> str:
+    from PIL import Image, ImageChops
+    img = Image.new("L", (width, height), 255)
+    
+    if fade_left > 0:
+        left_grad = Image.new("L", (fade_left, 1))
+        left_grad.putdata([int(x * 255 / fade_left) for x in range(fade_left)])
+        left_grad_stretched = left_grad.resize(
+            (fade_left, height), 
+            Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
+        )
+        full_left = Image.new("L", (width, height), 255)
+        full_left.paste(left_grad_stretched, (0, 0))
+        img = ImageChops.darker(img, full_left)
+        
+    if fade_top > 0:
+        top_grad = Image.new("L", (1, fade_top))
+        top_grad.putdata([int(y * 255 / fade_top) for y in range(fade_top)])
+        top_grad_stretched = top_grad.resize(
+            (width, fade_top), 
+            Image.Resampling.BILINEAR if hasattr(Image, 'Resampling') else Image.BILINEAR
+        )
+        full_top = Image.new("L", (width, height), 255)
+        full_top.paste(top_grad_stretched, (0, 0))
+        img = ImageChops.darker(img, full_top)
+        
+    path = os.path.join(temp_dir, f"alpha_mask_{idx}.png")
+    img.save(path, "PNG")
+    return path
 
 # Draw static camera framing details
 def draw_camera_overlay(width: int, height: int, config: RenderConfig, temp_dir: str) -> str:
@@ -1407,10 +1668,25 @@ def _render_video_impl(config: RenderConfig, progress_callback: Callable[[int, s
     progress_callback(35, "Đang thiết lập luồng video nền lặp vô hạn...")
     bg_videos = config.media.backgroundVideos
     
-    bg_video_path = None
-    if bg_videos and os.path.exists(bg_videos[0]):
-        bg_video_path = bg_videos[0]
-        progress_callback(38, f"Sử dụng video nền: {os.path.basename(bg_video_path)}")
+    active_bg_videos = [v for v in bg_videos if os.path.exists(v)]
+    bg_layout = getattr(config.background, 'layout', 'columns')
+    seam_style = getattr(config.background, 'seamOverlay', 'shadow')
+    seam_glow_color = getattr(config.background, 'seamGlowColor', '#8b5cf6')
+    
+    seam_overlay_path = None
+    
+    if len(active_bg_videos) > 0:
+        progress_callback(38, f"Đã tìm thấy {len(active_bg_videos)} tệp video nền. Bố cục: {bg_layout}.")
+        if len(active_bg_videos) > 1 and seam_style != 'none':
+            progress_callback(39, "Đang khởi tạo các lớp phủ phân tách mềm mại giữa các video nền...")
+            res_str = config.render.resolution if config.render.resolution else "1920x1080"
+            try:
+                res_w_temp, res_h_temp = map(int, res_str.split("x"))
+            except Exception:
+                res_w_temp, res_h_temp = 1920, 1080
+            seam_overlay_path = generate_seam_overlay(
+                res_w_temp, res_h_temp, len(active_bg_videos), bg_layout, seam_style, seam_glow_color, temp_dir
+            )
     else:
         progress_callback(38, "Không tìm thấy video nền. Sử dụng nền đen chuẩn HD...")
         
@@ -1436,6 +1712,8 @@ def _render_video_impl(config: RenderConfig, progress_callback: Callable[[int, s
             if not item.enabled:
                 continue
             img_path = item.imagePath
+            if img_path:
+                img_path = img_path.strip('\"\' ')
             if img_path and os.path.exists(img_path):
                 try:
                     proc_path = process_image_overlay(img_path, item, temp_dir)
@@ -1445,16 +1723,23 @@ def _render_video_impl(config: RenderConfig, progress_callback: Callable[[int, s
     else:
         # Fallback to single cycle overlay
         overlay_images = config.media.overlayImages
+        print(f"[DIAGNOSTIC] Che do anh phu (overlay_mode): {overlay_mode}")
+        print(f"[DIAGNOSTIC] Danh sach config.media.overlayImages (tong so: {len(overlay_images) if overlay_images else 0}): {overlay_images}")
         processed_overlay_paths = []
         if overlay_images and config.imageOverlay.enabled:
             progress_callback(45, f"Áp dụng mặt nạ hình {config.imageOverlay.maskShape} lên các tệp ảnh phủ...")
             for img_path in overlay_images:
-                if img_path and os.path.exists(img_path):
+                exists = os.path.exists(img_path) if img_path else False
+                print(f"[DIAGNOSTIC] Kiem tra tep: {img_path} -> Ton tai: {exists}")
+                if img_path and exists:
                     try:
                         proc_path = process_image_overlay(img_path, config.imageOverlay, temp_dir)
                         processed_overlay_paths.append(proc_path)
+                        print(f"[DIAGNOSTIC] Da xu ly thanh cong: {img_path} -> {proc_path}")
                     except Exception as e:
-                        print(f"Error processing fallback overlay {img_path}: {e}")
+                        print(f"[DIAGNOSTIC] Loi xu ly fallback overlay {img_path}: {e}")
+                else:
+                    print(f"[DIAGNOSTIC] Bo qua vi khong ton tai hoac rong: {img_path}")
             
         overlay_img_list = []
         if processed_overlay_paths:
@@ -1462,16 +1747,22 @@ def _render_video_impl(config: RenderConfig, progress_callback: Callable[[int, s
                 try:
                     overlay_img_list.append(Image.open(path).convert("RGBA"))
                 except Exception as e:
-                    print(f"Error loading overlay image {path} into RAM: {e}")
+                    print(f"[DIAGNOSTIC] Loi load overlay image {path} vao RAM: {e}")
                     
         overlay_img_objs = overlay_img_list # list mapping to original variable
         
         # Pre-compute the active overlay index for each frame
+        print(f"[DIAGNOSTIC] So anh overlay da load thanh cong: {len(processed_overlay_paths)}")
         if overlay_img_objs:
             if len(processed_overlay_paths) == 1:
+                print(f"[DIAGNOSTIC] Chi co 1 anh, gan chi so 0 cho toan bo frame.")
                 active_overlay_by_frame = [0] * (total_frames + 100)
             else:
-                swap_interval = getattr(config.imageOverlay, 'imageDuration', 5.0)
+                auto_fit = getattr(config.imageOverlay, 'autoFitDuration', False)
+                if auto_fit and len(processed_overlay_paths) > 0:
+                    swap_interval = voice_duration / len(processed_overlay_paths)
+                else:
+                    swap_interval = getattr(config.imageOverlay, 'imageDuration', 5.0)
                 if swap_interval is None or swap_interval <= 0:
                     swap_interval = 5.0
                 num_intervals = math.ceil(voice_duration / swap_interval)
@@ -1485,11 +1776,18 @@ def _render_video_impl(config: RenderConfig, progress_callback: Callable[[int, s
                 else:
                     interval_indices = [i % len(processed_overlay_paths) for i in range(num_intervals)]
                     
+                print(f"[DIAGNOSTIC] swap_interval: {swap_interval}, auto_fit: {auto_fit}, voice_duration: {voice_duration}")
+                print(f"[DIAGNOSTIC] num_intervals: {num_intervals}, interval_indices: {interval_indices[:30]}")
+                
                 for f_idx in range(total_frames + 100):
                     t_val = f_idx / fps
                     interval_idx = int(t_val // swap_interval)
                     interval_idx = min(interval_idx, num_intervals - 1)
                     active_overlay_by_frame.append(interval_indices[interval_idx])
+                    
+                print(f"[DIAGNOSTIC] Da sinh active_overlay_by_frame do dai {len(active_overlay_by_frame)}")
+                if len(active_overlay_by_frame) > 0:
+                    print(f"[DIAGNOSTIC] Vai phan tu dau cua active_overlay_by_frame: {active_overlay_by_frame[:10]}")
         
     progress_callback(50, "Đang vẽ giao diện ghi hình kỹ thuật số (Camera Overlays)...")
     camera_overlay_path = draw_camera_overlay(res_w, res_h, config, temp_dir)
@@ -1503,33 +1801,67 @@ def _render_video_impl(config: RenderConfig, progress_callback: Callable[[int, s
     ffmpeg_inputs = []
     input_counter = 0
     
-    # Input 0: Background video loop (or black color canvas)
-    if bg_video_path:
-        ffmpeg_inputs += ["-stream_loop", "-1", "-i", bg_video_path]
+    # Background video inputs
+    num_bg = len(active_bg_videos)
+    if num_bg > 0:
+        for v_path in active_bg_videos:
+            ffmpeg_inputs += ["-stream_loop", "-1", "-i", v_path]
+        input_counter += num_bg
     else:
         ffmpeg_inputs += ["-f", "lavfi", "-i", f"color=c=black:s={res_w}x{res_h}:r={fps}"]
-    bg_index = input_counter
-    input_counter += 1
+        input_counter += 1
         
-    # Input 1: Mixed audio file
+    # Mixed audio file
     ffmpeg_inputs += ["-i", mixed_audio_path]
     audio_index = input_counter
     input_counter += 1
     
-    # Input 2: Waveform raw RGBA video pipe stream
+    # Waveform raw RGBA video pipe stream
     ffmpeg_inputs += ["-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{res_w}x{res_h}", "-r", str(fps), "-i", "-"]
     wave_index = input_counter
     input_counter += 1
     
-    # Input 3: Processed overlay images (if present) - DEPRECATED: Drawn in Pillow for high-fidelity audio-reactive bounce
-    overlay_start_index = -1
+    # Seam overlay input
+    seam_index = -1
+    if seam_overlay_path and os.path.exists(seam_overlay_path):
+        ffmpeg_inputs += ["-i", seam_overlay_path]
+        seam_index = input_counter
+        input_counter += 1
         
-    # Input 4: Camera overlay image (if present)
+    # Camera overlay image
     camera_index = -1
     if config.camera.enabled:
         ffmpeg_inputs += ["-i", camera_overlay_path]
         camera_index = input_counter
         input_counter += 1
+        
+    # Video Overlay inputs
+    video_overlay_indices = {}
+    if getattr(config, 'videoOverlay', None) and config.videoOverlay.enabled and config.videoOverlay.items:
+        for item in config.videoOverlay.items:
+            if not item.enabled:
+                continue
+            vo_path = item.videoPath
+            if vo_path and os.path.exists(vo_path):
+                if item.loop or item.repeatInterval > 0.0:
+                    ffmpeg_inputs += ["-stream_loop", "-1", "-i", vo_path]
+                else:
+                    ffmpeg_inputs += ["-i", vo_path]
+                video_overlay_indices[item.id] = input_counter
+                input_counter += 1
+        
+    # Generate feather alpha masks and add them to inputs
+    mask_indices = {}
+    f_width = getattr(config.background, 'featherWidth', 80) or 80
+    if num_bg > 1 and seam_style == 'feather':
+        for i in range(num_bg):
+            if i == 0:
+                continue
+            w_slot, h_slot, _, _, fade_left, fade_top = calculate_feather_slot(i, num_bg, res_w, res_h, bg_layout, f_width)
+            mask_path = generate_alpha_mask(w_slot, h_slot, fade_left, fade_top, temp_dir, i)
+            ffmpeg_inputs += ["-i", mask_path]
+            mask_indices[i] = input_counter
+            input_counter += 1
         
     # ----------------------------------------------------
     # BƯỚC 6: Xây dựng filter_complex đồ họa tối ưu
@@ -1538,20 +1870,94 @@ def _render_video_impl(config: RenderConfig, progress_callback: Callable[[int, s
     
     filter_parts = []
     
-    # 1. Scale background video to target resolution, reset SAR to 1:1, and apply smooth blur
+    # 1. Background Layer: process and combine (split screen / grid)
     blur_percent = config.background.blurPercent
-    # Scale blur radius relative to target resolution and boxblur power to match Web Gaussian blur perfectly
     blur_radius = max(1, int((blur_percent / 100.0) * (res_w / 1024.0) * 25)) if blur_percent > 0 else 0
     
-    # Reset Sample Aspect Ratio (SAR) to 1:1 to prevent anamorphic stretching of background and overlays
-    bg_filter = f"[0:v]setsar=1,scale={res_w}:{res_h}:force_original_aspect_ratio=decrease:flags=lanczos,pad={res_w}:{res_h}:(ow-iw)/2:(oh-ih)/2"
-    if blur_radius > 0:
-        bg_filter += f",boxblur=luma_radius={blur_radius}:luma_power=3"
+    if num_bg > 1:
+        # Scale/crop each background video slot
+        slot_positions = []
+        for i in range(num_bg):
+            if seam_style == 'feather':
+                w_slot, h_slot, x_pos, y_pos, _, _ = calculate_feather_slot(i, num_bg, res_w, res_h, bg_layout, f_width)
+            else:
+                if bg_layout == "columns":
+                    w_slot = res_w // num_bg if i < num_bg - 1 else (res_w - (num_bg - 1) * (res_w // num_bg))
+                    h_slot = res_h
+                    x_pos = i * (res_w // num_bg)
+                    y_pos = 0
+                elif bg_layout == "rows":
+                    w_slot = res_w
+                    h_slot = res_h // num_bg if i < num_bg - 1 else (res_h - (num_bg - 1) * (res_h // num_bg))
+                    x_pos = 0
+                    y_pos = i * (res_h // num_bg)
+                else: # "grid"
+                    if num_bg == 2:
+                        w_slot = res_w // 2 if i == 0 else (res_w - res_w // 2)
+                        h_slot = res_h
+                        x_pos = i * (res_w // 2)
+                        y_pos = 0
+                    elif num_bg == 3:
+                        if i == 0:
+                            w_slot = res_w // 2
+                            h_slot = res_h // 2
+                            x_pos = 0
+                            y_pos = 0
+                        elif i == 1:
+                            w_slot = res_w - res_w // 2
+                            h_slot = res_h // 2
+                            x_pos = res_w // 2
+                            y_pos = 0
+                        else:
+                            w_slot = res_w
+                            h_slot = res_h - res_h // 2
+                            x_pos = 0
+                            y_pos = res_h // 2
+                    else: # 4 videos grid
+                        w_slot = res_w // 2 if i in (0, 2) else (res_w - res_w // 2)
+                        h_slot = res_h // 2 if i in (0, 1) else (res_h - res_h // 2)
+                        x_pos = 0 if i in (0, 2) else (res_w // 2)
+                        y_pos = 0 if i in (0, 1) else (res_h // 2)
+            
+            # Force even dimensions for yuv420p video format compatibility
+            w_slot = (w_slot // 2) * 2
+            h_slot = (h_slot // 2) * 2
+
+            slot_positions.append((x_pos, y_pos))
+            filter_parts.append(
+                f"[{i}:v]setsar=1,scale={w_slot}:{h_slot}:force_original_aspect_ratio=increase,crop={w_slot}:{h_slot}[bg_part{i}]"
+            )
+            if seam_style == 'feather' and i > 0:
+                mask_idx = mask_indices[i]
+                filter_parts.append(
+                    f"[bg_part{i}][{mask_idx}:v]alphamerge[bg_masked{i}]"
+                )
+            
+        # Overlay processed slots onto a black canvas
+        filter_parts.append(f"color=c=black:s={res_w}x{res_h}:r={fps}[bg_base]")
+        last_label = "[bg_base]"
+        for i in range(num_bg):
+            x_pos, y_pos = slot_positions[i]
+            next_label = f"[bg_layer{i}]" if i < num_bg - 1 else "[bg_raw_combined]"
+            overlay_input = f"[bg_masked{i}]" if (seam_style == 'feather' and i > 0) else f"[bg_part{i}]"
+            filter_parts.append(f"{last_label}{overlay_input}overlay=x={x_pos}:y={y_pos}{next_label}")
+            last_label = next_label
     else:
-        # High quality sharpening pass only when background is not blurred to make it pop
-        bg_filter += ",unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.25"
-    bg_filter += "[bg_scaled]"
-    filter_parts.append(bg_filter)
+        # Fallback to single background video or black canvas
+        bg_filter = f"[0:v]setsar=1,scale={res_w}:{res_h}:force_original_aspect_ratio=decrease:flags=lanczos,pad={res_w}:{res_h}:(ow-iw)/2:(oh-ih)/2[bg_raw_combined]"
+        filter_parts.append(bg_filter)
+        
+    # Apply background blur or sharpen
+    if blur_radius > 0:
+        filter_parts.append(f"[bg_raw_combined]boxblur=luma_radius={blur_radius}:luma_power=3[bg_combined]")
+    else:
+        filter_parts.append(f"[bg_raw_combined]unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount=0.25[bg_combined]")
+        
+    # Overlay seam divider borders (if present)
+    if seam_overlay_path and seam_index != -1:
+        filter_parts.append(f"[bg_combined][{seam_index}:v]overlay=0:0[bg_scaled]")
+    else:
+        filter_parts.append(f"[bg_combined]null[bg_scaled]")
     
     # 2 & 3. Overlay Waveform (which already contains pre-composited, bouncing image overlays from Pillow!)
     filter_parts.append(f"[bg_scaled][{wave_index}:v]overlay=0:0[v_wave]")
@@ -1561,6 +1967,54 @@ def _render_video_impl(config: RenderConfig, progress_callback: Callable[[int, s
     if config.camera.enabled and camera_index != -1:
         filter_parts.append(f"{current_v_label}[{camera_index}:v]overlay=0:0[v_camera]")
         current_v_label = "[v_camera]"
+        
+    # 4b. Overlay Video Overlays
+    if getattr(config, 'videoOverlay', None) and config.videoOverlay.enabled and config.videoOverlay.items:
+        for item in config.videoOverlay.items:
+            if item.id not in video_overlay_indices:
+                continue
+            vo_idx = video_overlay_indices[item.id]
+            vo_w = item.width
+            vo_h = item.height
+            vo_x = item.x - vo_w // 2
+            vo_y = item.y - vo_h // 2
+            vo_opacity = item.opacity
+            
+            ck_color = item.chromaKeyColor.replace('#', '0x')
+            ck_sim = item.chromaKeySimilarity
+            ck_blend = item.chromaKeyBlend
+            
+            vo_filter = f"[{vo_idx}:v]scale={vo_w}:{vo_h}"
+            if item.chromaKeyEnabled:
+                # Always use colorkey (RGB space) to match the HTML5 canvas preview algorithm 1:1,
+                # preventing discrepancy issues where YUV-based chromakey incorrectly keys out neutral colors (white/gray/black) 
+                # under higher similarity thresholds.
+                vo_filter += f",colorkey={ck_color}:{ck_sim}:{ck_blend}"
+            
+            # Explicitly force RGBA pixel format to guarantee alpha channel preservation
+            # and flawless blending in the overlay filter, matching the frontend canvas.
+            vo_filter += ",format=rgba"
+            
+            if vo_opacity < 1.0:
+                vo_filter += f",colorchannelmixer=aa={vo_opacity}"
+            
+            vo_filter_label = f"[vo_processed_{item.id}]"
+            vo_filter += vo_filter_label
+            filter_parts.append(vo_filter)
+            
+            vo_repeat = item.repeatInterval
+            overlay_opt = f"x={vo_x}:y={vo_y}"
+            if vo_repeat > 0.0:
+                try:
+                    vo_duration = get_media_duration(item.videoPath)
+                except Exception:
+                    vo_duration = 5.0
+                interval_sec = int(vo_repeat * 60)
+                overlay_opt += f":enable='lt(mod(t,{interval_sec}),{vo_duration:.3f})'"
+                
+            next_v_label = f"[v_overlay_{item.id}]"
+            filter_parts.append(f"{current_v_label}{vo_filter_label}overlay={overlay_opt}{next_v_label}")
+            current_v_label = next_v_label
         
     # 5. Build Subtitles ASS Overlay
     ass_subtitles_path = None
@@ -1628,7 +2082,7 @@ def _render_video_impl(config: RenderConfig, progress_callback: Callable[[int, s
     ] + ffmpeg_inputs + [
         "-filter_complex", filter_complex_str,
         "-map", current_v_label,
-        "-map", "1:a",
+        "-map", f"{audio_index}:a",
         "-c:v", encoder,
     ] + quality_params + [
         "-threads", threads_val,   # Direct multi-threading to use all available CPU cores

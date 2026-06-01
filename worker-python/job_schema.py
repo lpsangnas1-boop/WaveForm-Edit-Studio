@@ -15,6 +15,10 @@ class BackgroundConfig(BaseModel):
     transitionDuration: float = Field(default=1.0)
     randomVideoOrder: bool = Field(default=True)
     fillTimeline: bool = Field(default=True)
+    layout: Optional[str] = Field(default="columns")
+    seamOverlay: Optional[str] = Field(default="shadow")
+    seamGlowColor: Optional[str] = Field(default="#8b5cf6")
+    featherWidth: Optional[int] = Field(default=80)
 
 class ImageOverlayItem(BaseModel):
     id: str
@@ -30,7 +34,12 @@ class ImageOverlayItem(BaseModel):
     maskShape: str = Field(default="circle")
     inset: int = Field(default=10)
     feather: int = Field(default=0)
+    roundCorners: Optional[int] = Field(default=0)
     bounceEnabled: bool = Field(default=False)
+    borderEnabled: Optional[bool] = Field(default=False)
+    borderWidth: Optional[int] = Field(default=8)
+    borderColor: Optional[str] = Field(default="#ffffff")
+    chromaKeyEnabled: Optional[bool] = Field(default=False)
 
 class ImageOverlayConfig(BaseModel):
     enabled: bool = Field(default=True)
@@ -44,12 +53,38 @@ class ImageOverlayConfig(BaseModel):
     maskShape: str = Field(default="circle")
     inset: int = Field(default=10)
     feather: int = Field(default=0)
+    roundCorners: Optional[int] = Field(default=0)
     imageDuration: float = Field(default=5.0)
     imageTransitionDuration: float = Field(default=1.0)
+    autoFitDuration: Optional[bool] = Field(default=False)
     randomImageOrder: bool = Field(default=False)
     bounceEnabled: bool = Field(default=False)
     items: Optional[List[ImageOverlayItem]] = Field(default_factory=list)
     overlayMode: str = Field(default="cycle")
+    borderEnabled: Optional[bool] = Field(default=False)
+    borderWidth: Optional[int] = Field(default=8)
+    borderColor: Optional[str] = Field(default="#ffffff")
+    chromaKeyEnabled: Optional[bool] = Field(default=False)
+
+class VideoOverlayItem(BaseModel):
+    id: str
+    videoPath: str
+    enabled: bool = Field(default=True)
+    x: int = Field(default=960)
+    y: int = Field(default=540)
+    width: int = Field(default=600)
+    height: int = Field(default=450)
+    opacity: float = Field(default=1.0, ge=0.0, le=1.0)
+    chromaKeyEnabled: bool = Field(default=True)
+    chromaKeyColor: str = Field(default="#00ff00")
+    chromaKeySimilarity: float = Field(default=0.18)
+    chromaKeyBlend: float = Field(default=0.04)
+    loop: bool = Field(default=True)
+    repeatInterval: float = Field(default=0.0)
+
+class VideoOverlayConfig(BaseModel):
+    enabled: bool = Field(default=True)
+    items: Optional[List[VideoOverlayItem]] = Field(default_factory=list)
 
 class WaveformConfig(BaseModel):
     enabled: bool = Field(default=True)
@@ -116,6 +151,7 @@ class RenderConfig(BaseModel):
     media: MediaConfig
     background: BackgroundConfig
     imageOverlay: ImageOverlayConfig
+    videoOverlay: Optional[VideoOverlayConfig] = Field(default=None)
     waveform: WaveformConfig
     subtitles: SubtitlesConfig
     camera: CameraConfig
